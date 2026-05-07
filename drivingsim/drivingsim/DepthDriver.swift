@@ -81,6 +81,7 @@ final class DepthDriver: ObservableObject {
     private var escapePhase = 0
     private var smoother: [DrivingCommand] = []
     private var lastCommand: DrivingCommand = .brake   // for hysteresis bias
+    private var zoneLogCount = 0
 
     // Model
     nonisolated(unsafe) private var model: MLModel?
@@ -145,6 +146,8 @@ final class DepthDriver: ObservableObject {
         escapePhase = 0
         smoother.removeAll()
         lastCommand = .brake
+        zoneLogCount = 0
+        DepthDriver.diagLogged = false
         inFlight.withLock { $0 = false }
     }
 
@@ -255,6 +258,14 @@ final class DepthDriver: ObservableObject {
         lastCommand = smoothed   // hysteresis input for next frame
         command = smoothed
         depthImage = preview
+
+        // Periodic zone-score log so we can sanity-check the decision pipeline.
+        zoneLogCount += 1
+        if zoneLogCount >= 30 {
+            zoneLogCount = 0
+            let scores = z.map { String(format: "%3.0f", $0.obstacleScore) }.joined(separator: " ")
+            print("[DepthDriver] zones [FL L C R FR] = \(scores)  raw=\(raw.rawValue)  smoothed=\(smoothed.rawValue)")
+        }
 
         // Compound commands map directly to multi-key sets.
         switch smoothed {
@@ -418,24 +429,50 @@ final class DepthDriver: ObservableObject {
             }
         }
 
-        // Per-frame min/max (matches new Python script — single pass, no smoothing).
         var dMin = Float.infinity
         var dMax = -Float.infinity
         for v in floats {
             if v < dMin { dMin = v }
             if v > dMax { dMax = v }
         }
+
+        // One-time diagnostic: log raw values + format so we can confirm polarity.
+        // top-mid pixel ≈ ceiling/wall (typically far), bottom-mid ≈ floor (close).
+        // If model outputs DEPTH (large=far): top RAW < bottom RAW expected.
+        // If model outputs DISPARITY (large=close): top RAW > bottom RAW.
+        if !diagLogged {
+            diagLogged = true
+            let topMidRaw    = floats[5 * w + w / 2]
+            let centerRaw    = floats[(h / 2) * w + w / 2]
+            let bottomMidRaw = floats[(h - 5) * w + w / 2]
+            let fmtName: String
+            switch format {
+            case kCVPixelFormatType_OneComponent16Half: fmtName = "F16"
+            case kCVPixelFormatType_OneComponent32Float: fmtName = "F32"
+            case kCVPixelFormatType_OneComponent8:       fmtName = "U8"
+            default: fmtName = String(format: "0x%X", format)
+            }
+            print(String(format: "[DepthDriver] DIAG fmt=%@ %dx%d  raw min=%.4f max=%.4f  top=%.4f center=%.4f bottom=%.4f",
+                         fmtName, w, h, dMin, dMax, topMidRaw, centerRaw, bottomMidRaw))
+            print("[DepthDriver] DIAG  if bottom>top → DISPARITY (need invert);  if bottom<top → DEPTH (current code correct)")
+        }
+
         let dRange = dMax - dMin
         var u8 = [UInt8](repeating: 0, count: w * h)
         if dRange > 1e-6 {
             for i in 0..<floats.count {
                 var n = (floats[i] - dMin) / dRange
                 if n < 0 { n = 0 } else if n > 1 { n = 1 }
-                u8[i] = 255 - UInt8(n * 255.0)   // invert: high=near/obstacle, low=far/clear
+                // No invert. Apple's "Estimated depth map" output: large value = far.
+                // After normalization: high u8 = far (clear), low u8 = near (obstacle).
+                // Decision tree thresholds operate on this directly.
+                u8[i] = UInt8(n * 255.0)
             }
         }
         return (u8, w, h)
     }
+
+    nonisolated(unsafe) private static var diagLogged = false
 
     nonisolated static func colorize(depthU8: [UInt8], width: Int, height: Int) -> CGImage? {
         guard !depthU8.isEmpty else { return nil }
