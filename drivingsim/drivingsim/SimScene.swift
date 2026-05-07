@@ -17,13 +17,15 @@ final class SimScene {
     private(set) var car: ModelEntity!
     private var cam: PerspectiveCamera!
 
-    // Car tunables — RC-car scale, indoor speeds.
-    private let maxSpeed:      Float = 3.0    // ~11 km/h, brisk indoor RC
-    private let accel:         Float = 2.0
-    private let brakeDecel:    Float = 4.0
-    private let coastDrag:     Float = 1.5
-    private let maxSteerRate:  Float = 1.8
-    private let steerSpeedRef: Float = 0.8    // full steer at low speed
+    // Car tunables — autonomous indoor RC robot speeds (TurtleBot-class).
+    // ~0.6 m/s ≈ 2 km/h, brisk walking pace ÷ 3. Realistic for vision-based
+    // autonomous navigation where reaction time + braking distance matter.
+    private let maxSpeed:      Float = 0.6
+    private let accel:         Float = 0.4
+    private let brakeDecel:    Float = 0.8
+    private let coastDrag:     Float = 0.4
+    private let maxSteerRate:  Float = 1.2
+    private let steerSpeedRef: Float = 0.3   // full steer at low speed
 
     // FPV camera — RC car eye-line ~6cm above floor.
     private let eyeHeight:     Float = 0.06
