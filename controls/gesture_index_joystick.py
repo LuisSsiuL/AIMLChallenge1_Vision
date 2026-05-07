@@ -21,6 +21,8 @@ Controls:
   SPACE pause / resume key output
 """
 
+import json
+import os
 import sys
 import time
 
@@ -37,13 +39,36 @@ except Exception as e:
     _kb = None
     _PYNPUT_OK = False
 
-# ── constants ─────────────────────────────────────────────────────────────────
-DEADZONE_LEN  = 0.10   # min |vec| / hand_size to leave deadzone (magnitude gate)
-DEADZONE_X    = 0.14   # per-axis threshold for A/D
-DEADZONE_Y_NEG = 0.006  # threshold for W (finger up, negative Y)
-DEADZONE_Y_POS = 0.120  # threshold for S (finger down, positive Y)
-EMA_ALPHA     = 0.50   # agile filter weight (prev frame)
-FIST_DIST     = 0.65   # tip-to-wrist / hand_size below this = tip is "tucked in"
+# ── constants (loaded from joystick_config.json with fallback defaults) ───────
+_DEFAULTS = {
+    "deadzone_len":    0.10,
+    "deadzone_x":      0.14,
+    "deadzone_y_neg":  0.006,
+    "deadzone_y_pos":  0.120,
+    "ema_alpha":       0.50,
+    "fist_dist":       0.65,
+    "extension_ratio": 1.3,
+}
+
+def _load_config():
+    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "joystick_config.json")
+    cfg = dict(_DEFAULTS)
+    try:
+        with open(cfg_path, "r") as f:
+            cfg.update({k: float(v) for k, v in json.load(f).items() if k in _DEFAULTS})
+    except (FileNotFoundError, json.JSONDecodeError, ValueError) as e:
+        print(f"[INFO] joystick_config.json not loaded ({e}); using defaults.")
+    return cfg
+
+_CFG = _load_config()
+DEADZONE_LEN    = _CFG["deadzone_len"]
+DEADZONE_X      = _CFG["deadzone_x"]
+DEADZONE_Y_NEG  = _CFG["deadzone_y_neg"]
+DEADZONE_Y_POS  = _CFG["deadzone_y_pos"]
+EMA_ALPHA       = _CFG["ema_alpha"]
+FIST_DIST       = _CFG["fist_dist"]
+EXTENSION_RATIO = _CFG["extension_ratio"]
 
 # ── MediaPipe setup ───────────────────────────────────────────────────────────
 mp_hands   = mp.solutions.hands
@@ -95,7 +120,7 @@ def compute_keys(lms):
     # Catches relaxed/splayed hand where finger isn't truly pointing.
     mcp_wrist_dist = np.linalg.norm(mcp - lms[0])
     tip_wrist_dist = np.linalg.norm(tip - lms[0])
-    if tip_wrist_dist < mcp_wrist_dist * 1.3:
+    if tip_wrist_dist < mcp_wrist_dist * EXTENSION_RATIO:
         return set(), np.zeros(2), False
 
     vec = tip - mcp                             # raw pixel vector

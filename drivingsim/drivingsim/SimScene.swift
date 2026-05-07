@@ -125,8 +125,12 @@ final class SimScene {
                 h = frand(2.5, 5.5)
             }
 
-            // random yaw rotation for variety (walls and big boulders look better rotated)
-            let rot = frand(-Float.pi, Float.pi)
+            // Quantized yaw: 0° or 90° only, so AABB collision stays honest.
+            // (Free rotation needs OBB collision; over-approx caused invisible walls.)
+            let rotateNinety = Bool.random(using: &rng)
+            let rot: Float = rotateNinety ? .pi / 2 : 0
+            let collHalfX = rotateNinety ? d / 2 : w / 2
+            let collHalfZ = rotateNinety ? w / 2 : d / 2
 
             let pos = SIMD3<Float>(ox, h / 2, oz)
             let mesh = MeshResource.generateBox(width: w, height: h, depth: d)
@@ -136,10 +140,7 @@ final class SimScene {
             ent.orientation = simd_quatf(angle: rot, axis: [0, 1, 0])
             root.addChild(ent)
 
-            // AABB collision uses rotated bounding circle approximation:
-            // expand half-extents to enclosing radius so collision still works after yaw
-            let r = sqrt((w / 2) * (w / 2) + (d / 2) * (d / 2))
-            obstacles.append(Obstacle(pos: pos, halfX: r, halfZ: r))
+            obstacles.append(Obstacle(pos: pos, halfX: collHalfX, halfZ: collHalfZ))
         }
 
         // Car — tiny invisible mesh (FPV: not rendered visibly)
@@ -167,11 +168,11 @@ final class SimScene {
         root.addChild(cam)
     }
 
-    func startUpdates(keyboard: KeyboardMonitor) {
+    func startUpdates(keyboard: KeyboardMonitor, hand: HandJoystick) {
         guard timer == nil else { return }
         let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             guard let self else { return }
-            Task { @MainActor in self.tick(kb: keyboard, dt: 1.0 / 60.0) }
+            Task { @MainActor in self.tick(kb: keyboard, hand: hand, dt: 1.0 / 60.0) }
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
@@ -182,11 +183,17 @@ final class SimScene {
         timer = nil
     }
 
-    private func tick(kb: KeyboardMonitor, dt: Float) {
+    private func tick(kb: KeyboardMonitor, hand: HandJoystick, dt: Float) {
+        // OR keyboard + hand inputs
+        let inForward  = kb.forward  || hand.forward
+        let inBackward = kb.backward || hand.backward
+        let inLeft     = kb.left     || hand.left
+        let inRight    = kb.right    || hand.right
+
         // ── Throttle / brake ──
-        if kb.forward {
+        if inForward {
             speed = min(speed + accel * dt, maxSpeed)
-        } else if kb.backward {
+        } else if inBackward {
             speed = max(speed - brakeDecel * dt, -maxSpeed * 0.5)
         } else {
             let drag = coastDrag * dt
@@ -195,7 +202,7 @@ final class SimScene {
 
         // ── Steering ──
         let speedFactor = min(1, abs(speed) / steerSpeedRef)
-        let steerInput: Float = (kb.right ? 1 : 0) + (kb.left ? -1 : 0)
+        let steerInput: Float = (inRight ? 1 : 0) + (inLeft ? -1 : 0)
         let yawRate     = steerInput * maxSteerRate * speedFactor * (speed >= 0 ? 1 : -1)
         yaw += yawRate * dt
 

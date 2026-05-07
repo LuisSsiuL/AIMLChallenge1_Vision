@@ -1,0 +1,9 @@
+{
+  "deadzone_len":   0.10,
+  "deadzone_x":     0.14,
+  "deadzone_y_neg": 0.006,
+  "deadzone_y_pos": 0.120,
+  "ema_alpha":      0.50,
+  "fist_dist":      0.65,
+  "extension_ratio": 1.3
+}
