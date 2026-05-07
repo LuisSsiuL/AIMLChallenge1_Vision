@@ -53,29 +53,21 @@ final class DepthDriver: ObservableObject {
     @Published private(set) var command: DrivingCommand = .brake
     @Published private(set) var zones: [ZoneScore] = []
     @Published private(set) var depthImage: CGImage?    // colourised depth for preview
-    @Published private(set) var floorBaseline: Float = 20
 
     var forward:  Bool { keys.contains(KeyboardMonitor.W) }
     var backward: Bool { keys.contains(KeyboardMonitor.S) }
     var left:     Bool { keys.contains(KeyboardMonitor.A) }
     var right:    Bool { keys.contains(KeyboardMonitor.D) }
 
-    // Tunables — same names/values as live_depth_wasd.py
+    // Tunables — match live_depth_mlmodel_wasd.py (simplified pipeline).
     private let forwardThreshold:    Float = 150
     private let reverseThreshold:    Float = 80
     private let steerMinDiff:        Float = 10
-    private let floorEmaAlpha:       Float = 0.15
     private let navRowStart:         Float = 0.30
-    private let floorBandFraction:   Float = 0.10
     private let cmdSmoothFrames:     Int   = 5
     private let reverseEscapeFrames: Int   = 10
-    private let depthEmaAlpha:       Float = 0.10
-    private let depthPercentile:     Float = 2
 
-    // Perception state
-    nonisolated(unsafe) private var emaDmin: Float?
-    nonisolated(unsafe) private var emaDmax: Float?
-    private var floorBaselineState: Float?
+    // Perception state — no percentile-EMA, no floor baseline (dropped per new script).
     private var consecutiveReverse = 0
     private var escapePhase = 0
     private var smoother: [DrivingCommand] = []
@@ -142,9 +134,6 @@ final class DepthDriver: ObservableObject {
         consecutiveReverse = 0
         escapePhase = 0
         smoother.removeAll()
-        emaDmin = nil
-        emaDmax = nil
-        floorBaselineState = nil
         inFlight.withLock { $0 = false }
     }
 
@@ -204,11 +193,7 @@ final class DepthDriver: ObservableObject {
             return
         }
 
-        let (depthU8, w, h) = Self.depthBufferToU8(outBuf,
-                                                    percentile: 2.0,
-                                                    emaAlpha: 0.10,
-                                                    emaDmin: &emaDmin,
-                                                    emaDmax: &emaDmax)
+        let (depthU8, w, h) = Self.depthBufferToU8(outBuf)
 
         // Build colourised CGImage for preview (inferno-ish gradient).
         let preview = Self.colorize(depthU8: depthU8, width: w, height: h)
@@ -249,20 +234,7 @@ final class DepthDriver: ObservableObject {
         let row0 = Int(Float(h) * navRowStart)
         let safeRow0 = min(max(0, row0), h - 1)
 
-        // Floor baseline EMA from bottom band
-        let bandH = max(1, Int(Float(h - safeRow0) * floorBandFraction))
-        let bandStart = h - bandH
-        let bandMedian = Self.medianRows(depthU8, w: w, rowStart: bandStart, rowEnd: h)
-        let newBaseline: Float
-        if let cur = floorBaselineState {
-            newBaseline = floorEmaAlpha * bandMedian + (1.0 - floorEmaAlpha) * cur
-        } else {
-            newBaseline = bandMedian
-        }
-        floorBaselineState = min(max(newBaseline, 20), 200)
-        floorBaseline = floorBaselineState!
-
-        // Zone scores
+        // Zone scores (no floor baseline — matches live_depth_mlmodel_wasd.py)
         let z = computeZoneScores(depthU8: depthU8, w: w, h: h, rowStart: safeRow0)
         zones = z
 
@@ -398,13 +370,9 @@ final class DepthDriver: ObservableObject {
 
     // ── Static helpers (depth post-processing) ───────────────────────────────
 
-    nonisolated static func depthBufferToU8(
-        _ buf: CVPixelBuffer,
-        percentile: Float,
-        emaAlpha: Float,
-        emaDmin: inout Float?,
-        emaDmax: inout Float?
-    ) -> ([UInt8], Int, Int) {
+    /// Single-pass per-frame min/max normalization + invert.
+    /// Matches live_depth_mlmodel_wasd.py:103-121 (no percentile, no EMA).
+    nonisolated static func depthBufferToU8(_ buf: CVPixelBuffer) -> ([UInt8], Int, Int) {
         CVPixelBufferLockBaseAddress(buf, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buf, .readOnly) }
         let w = CVPixelBufferGetWidth(buf)
@@ -413,12 +381,9 @@ final class DepthDriver: ObservableObject {
         let format = CVPixelBufferGetPixelFormatType(buf)
         guard let base = CVPixelBufferGetBaseAddress(buf) else { return ([], 0, 0) }
 
-        // Read into [Float] then percentile-clip → EMA bounds → invert → u8
         var floats = [Float](repeating: 0, count: w * h)
-
         switch format {
         case kCVPixelFormatType_OneComponent16Half:
-            // F16 grayscale — common for Apple's CoreML depth output
             for y in 0..<h {
                 let row = base.advanced(by: y * stride).assumingMemoryBound(to: UInt16.self)
                 for x in 0..<w {
@@ -440,7 +405,6 @@ final class DepthDriver: ObservableObject {
                 }
             }
         default:
-            // Fallback: treat as F16 anyway
             for y in 0..<h {
                 let row = base.advanced(by: y * stride).assumingMemoryBound(to: UInt16.self)
                 for x in 0..<w {
@@ -449,30 +413,20 @@ final class DepthDriver: ObservableObject {
             }
         }
 
-        // Percentile clip
-        let sorted = floats.sorted()
-        let lowIdx  = max(0, min(sorted.count - 1, Int(Float(sorted.count) * percentile / 100.0)))
-        let highIdx = max(0, min(sorted.count - 1, Int(Float(sorted.count) * (100.0 - percentile) / 100.0)))
-        let pLo = sorted[lowIdx]
-        let pHi = sorted[highIdx]
-
-        // EMA bounds
-        if let dmin = emaDmin, let dmax = emaDmax {
-            emaDmin = emaAlpha * pLo + (1 - emaAlpha) * dmin
-            emaDmax = emaAlpha * pHi + (1 - emaAlpha) * dmax
-        } else {
-            emaDmin = pLo
-            emaDmax = pHi
+        // Per-frame min/max (matches new Python script — single pass, no smoothing).
+        var dMin = Float.infinity
+        var dMax = -Float.infinity
+        for v in floats {
+            if v < dMin { dMin = v }
+            if v > dMax { dMax = v }
         }
-
-        let dRange = (emaDmax ?? pHi) - (emaDmin ?? pLo)
+        let dRange = dMax - dMin
         var u8 = [UInt8](repeating: 0, count: w * h)
         if dRange > 1e-6 {
-            let dmin = emaDmin ?? pLo
             for i in 0..<floats.count {
-                var n = (floats[i] - dmin) / dRange
+                var n = (floats[i] - dMin) / dRange
                 if n < 0 { n = 0 } else if n > 1 { n = 1 }
-                u8[i] = 255 - UInt8(n * 255.0)   // invert: bright=near, dark=far
+                u8[i] = 255 - UInt8(n * 255.0)   // invert: high=near/obstacle, low=far/clear
             }
         }
         return (u8, w, h)
@@ -518,15 +472,4 @@ final class DepthDriver: ObservableObject {
         return Float(variance.squareRoot())
     }
 
-    nonisolated static func medianRows(_ a: [UInt8], w: Int, rowStart: Int, rowEnd: Int) -> Float {
-        let count = max(0, (rowEnd - rowStart) * w)
-        guard count > 0 else { return 0 }
-        var slice = [UInt8](); slice.reserveCapacity(count)
-        for y in rowStart..<rowEnd {
-            let row = y * w
-            for x in 0..<w { slice.append(a[row + x]) }
-        }
-        slice.sort()
-        return Float(slice[slice.count / 2])
-    }
 }
