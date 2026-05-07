@@ -49,6 +49,9 @@ _DEFAULTS = {
     "fist_dist":       0.65,
     "extension_ratio": 1.3,
     "hold_frames":     4,     # Swift temporal hold — Python ignores but keeps config canonical
+    "oef_min_cutoff":  1.0,   # Swift One Euro Filter — Python ignores
+    "oef_beta":        0.05,  # Swift One Euro Filter — Python ignores
+    "oef_dcutoff":     1.0,   # Swift One Euro Filter — Python ignores
 }
 
 def _load_config():

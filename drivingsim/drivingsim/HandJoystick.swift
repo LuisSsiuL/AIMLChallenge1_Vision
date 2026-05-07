@@ -2,10 +2,9 @@
 //  HandJoystick.swift
 //  drivingsim
 //
-//  Native Swift port of controls/gesture_index_joystick.py.
-//  Uses AVFoundation for webcam + Vision (VNDetectHumanHandPoseRequest)
-//  for 21 hand landmarks, then applies the same MCP→tip joystick geometry
-//  to produce WASD intent. No Python, no synthetic keyboard.
+//  Native Swift port of controls/gesture_index_joystick.py with adaptive
+//  smoothing (One Euro Filter, Casiez 2012) and velocity-based prediction
+//  through brief Vision dropouts.
 //
 //  Tunables loaded from controls/joystick_config.json (bundled or repo path).
 //
@@ -18,6 +17,54 @@ import os
 import SwiftUI
 import Vision
 
+// ── One Euro Filter ───────────────────────────────────────────────────────────
+//
+// Adaptive low-pass filter — cutoff rises with velocity so fast movement passes
+// through with low lag while slow/stationary motion gets aggressively smoothed.
+// Reference: https://gery.casiez.net/1euro/  (Casiez et al., SIGCHI 2012)
+//
+// Per-axis (scalar). For 21 landmarks × {x,y} we instantiate 42 of these.
+
+private struct OneEuroFilterScalar {
+    var minCutoff: Float = 1.0   // Hz — jitter rejection at rest
+    var beta:      Float = 0.0   // velocity-cutoff coefficient
+    var dCutoff:   Float = 1.0   // Hz — derivative low-pass cutoff
+
+    private var initialized = false
+    private var xPrev:  Float = 0       // last filtered value
+    private var dxPrev: Float = 0       // last filtered derivative (px/s)
+
+    private static func alpha(cutoff: Float, dt: Float) -> Float {
+        // tau = 1/(2π·cutoff); α = 1/(1 + τ/dt)  — canonical Casiez derivation
+        let tau = 1.0 / (2.0 * .pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+    }
+
+    mutating func filter(_ x: Float, dt: Float) -> Float {
+        let dtSafe = max(dt, 1e-6)
+        guard initialized else {
+            initialized = true; xPrev = x; dxPrev = 0
+            return x
+        }
+        let dx    = (x - xPrev) / dtSafe
+        let aD    = Self.alpha(cutoff: dCutoff, dt: dtSafe)
+        let dxHat = aD * dx + (1 - aD) * dxPrev
+        let cutoff = minCutoff + beta * abs(dxHat)
+        let aX    = Self.alpha(cutoff: cutoff, dt: dtSafe)
+        let xHat  = aX * x + (1 - aX) * xPrev
+        xPrev  = xHat
+        dxPrev = dxHat
+        return xHat
+    }
+
+    /// Smoothed velocity (units/s) — drives extrapolation during dropouts.
+    var velocity: Float { dxPrev }
+    /// Last filtered position — anchor for extrapolation.
+    var lastValue: Float { xPrev }
+
+    mutating func reset() { initialized = false; xPrev = 0; dxPrev = 0 }
+}
+
 // ── tunables ──────────────────────────────────────────────────────────────────
 
 private struct JoystickConfig: Codable {
@@ -25,23 +72,26 @@ private struct JoystickConfig: Codable {
     var deadzone_x:      Float
     var deadzone_y_neg:  Float
     var deadzone_y_pos:  Float
-    var ema_alpha:       Float
     var fist_dist:       Float
     var extension_ratio: Float
     var hold_frames:     Int
+    var oef_min_cutoff:  Float
+    var oef_beta:        Float
+    var oef_dcutoff:     Float
 
     static let defaults = JoystickConfig(
         deadzone_len:    0.10,
         deadzone_x:      0.14,
         deadzone_y_neg:  0.006,
         deadzone_y_pos:  0.120,
-        ema_alpha:       0.30,
         fist_dist:       0.65,
         extension_ratio: 1.3,
-        hold_frames:     4
+        hold_frames:     4,
+        oef_min_cutoff:  1.0,
+        oef_beta:        0.05,
+        oef_dcutoff:     1.0
     )
 
-    // Custom decoder: use decodeIfPresent per field so old JSON (missing hold_frames) still loads.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = JoystickConfig.defaults
@@ -49,23 +99,27 @@ private struct JoystickConfig: Codable {
         deadzone_x      = (try? c.decodeIfPresent(Float.self, forKey: .deadzone_x))      ?? d.deadzone_x
         deadzone_y_neg  = (try? c.decodeIfPresent(Float.self, forKey: .deadzone_y_neg))  ?? d.deadzone_y_neg
         deadzone_y_pos  = (try? c.decodeIfPresent(Float.self, forKey: .deadzone_y_pos))  ?? d.deadzone_y_pos
-        ema_alpha       = (try? c.decodeIfPresent(Float.self, forKey: .ema_alpha))       ?? d.ema_alpha
         fist_dist       = (try? c.decodeIfPresent(Float.self, forKey: .fist_dist))       ?? d.fist_dist
         extension_ratio = (try? c.decodeIfPresent(Float.self, forKey: .extension_ratio)) ?? d.extension_ratio
         hold_frames     = (try? c.decodeIfPresent(Int.self,   forKey: .hold_frames))     ?? d.hold_frames
+        oef_min_cutoff  = (try? c.decodeIfPresent(Float.self, forKey: .oef_min_cutoff))  ?? d.oef_min_cutoff
+        oef_beta        = (try? c.decodeIfPresent(Float.self, forKey: .oef_beta))        ?? d.oef_beta
+        oef_dcutoff     = (try? c.decodeIfPresent(Float.self, forKey: .oef_dcutoff))     ?? d.oef_dcutoff
     }
 
-    // Memberwise init (used by defaults and tests)
     init(deadzone_len: Float, deadzone_x: Float, deadzone_y_neg: Float, deadzone_y_pos: Float,
-         ema_alpha: Float, fist_dist: Float, extension_ratio: Float, hold_frames: Int) {
+         fist_dist: Float, extension_ratio: Float, hold_frames: Int,
+         oef_min_cutoff: Float, oef_beta: Float, oef_dcutoff: Float) {
         self.deadzone_len    = deadzone_len
         self.deadzone_x      = deadzone_x
         self.deadzone_y_neg  = deadzone_y_neg
         self.deadzone_y_pos  = deadzone_y_pos
-        self.ema_alpha       = ema_alpha
         self.fist_dist       = fist_dist
         self.extension_ratio = extension_ratio
         self.hold_frames     = hold_frames
+        self.oef_min_cutoff  = oef_min_cutoff
+        self.oef_beta        = oef_beta
+        self.oef_dcutoff     = oef_dcutoff
     }
 
     static func load() -> JoystickConfig {
@@ -113,13 +167,15 @@ final class HandJoystick: NSObject, ObservableObject {
     private let videoQueue  = DispatchQueue(label: "handjoystick.video",  qos: .userInitiated)
     private let visionQueue = DispatchQueue(label: "handjoystick.vision", qos: .userInitiated)
 
-    // Backlog coalesce: skip Vision + publish if previous MainActor update still pending.
-    // OSAllocatedUnfairLock is safe to call from any thread/actor.
+    // Backlog coalesce — drop frame if MainActor still draining previous one.
     nonisolated private let inFlight = OSAllocatedUnfairLock<Bool>(initialState: false)
 
-    private var emaLandmarks: [SIMD2<Float>]?
+    // 1€ filters: per-landmark, per-axis. 21 × 2 = 42 scalars.
+    private var oefX: [OneEuroFilterScalar] = Array(repeating: OneEuroFilterScalar(), count: 21)
+    private var oefY: [OneEuroFilterScalar] = Array(repeating: OneEuroFilterScalar(), count: 21)
+    private var lastFrameTime: CFTimeInterval = 0   // 0 = uninitialized
 
-    // Temporal hold: clear keys only after hold_frames consecutive no-hand frames.
+    // Temporal hold + prediction.
     private var noHandStreak = 0
 
     // ── MainActor pipeline stats ──
@@ -135,6 +191,27 @@ final class HandJoystick: NSObject, ObservableObject {
     nonisolated(unsafe) private var statWindowT  = CACurrentMediaTime()
     private let statInterval = 60
 
+    override init() {
+        super.init()
+        applyFilterParams()
+    }
+
+    private func applyFilterParams() {
+        for i in 0..<21 {
+            oefX[i].minCutoff = cfg.oef_min_cutoff
+            oefX[i].beta      = cfg.oef_beta
+            oefX[i].dCutoff   = cfg.oef_dcutoff
+            oefY[i].minCutoff = cfg.oef_min_cutoff
+            oefY[i].beta      = cfg.oef_beta
+            oefY[i].dCutoff   = cfg.oef_dcutoff
+        }
+    }
+
+    private func resetFilters() {
+        for i in 0..<21 { oefX[i].reset(); oefY[i].reset() }
+        lastFrameTime = 0
+    }
+
     func start() {
         AVCaptureDevice.requestAccess(for: .video) { [weak self] ok in
             guard ok else { print("[HandJoystick] camera access denied"); return }
@@ -148,8 +225,8 @@ final class HandJoystick: NSObject, ObservableObject {
         videoQueue.async { if s.isRunning { s.stopRunning() } }
         keys = []
         lastActive = false
-        emaLandmarks = nil
         noHandStreak = 0
+        resetFilters()
         inFlight.withLock { $0 = false }
     }
 
@@ -214,7 +291,6 @@ extension HandJoystick: AVCaptureVideoDataOutputSampleBufferDelegate {
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        // Drop frame if MainActor still processing previous one — prevents backlog drift.
         let busy = inFlight.withLock { state -> Bool in
             if state { return true }
             state = true; return false
@@ -242,13 +318,11 @@ extension HandJoystick: AVCaptureVideoDataOutputSampleBufferDelegate {
         statFrames += 1
 
         guard let obs = request.results?.first as? VNHumanHandPoseObservation else {
-            // Only log stats on no-hand path; don't accumulate infer sum (keeps avg honest).
             logStatsIfNeeded()
             Task { @MainActor in self.handleNoHand() }
             return
         }
 
-        // Accumulate inference stats only on detected frames (prevents avg > max bug).
         statDetected += 1
         statSumInfer += inferMs
         if inferMs > statMaxInfer { statMaxInfer = inferMs }
@@ -306,18 +380,42 @@ extension HandJoystick: AVCaptureVideoDataOutputSampleBufferDelegate {
     @MainActor
     private func handleNoHand() {
         noHandStreak += 1
+
+        // Past hold limit: give up, clear keys, reset filters so re-detection starts clean.
         if noHandStreak >= cfg.hold_frames {
-            if !keys.isEmpty     { keys = [] }
+            if !keys.isEmpty      { keys = [] }
             if !landmarks.isEmpty { landmarks = [] }
-            lastActive   = false
-            emaLandmarks = nil
+            lastActive = false
+            resetFilters()
+            inFlight.withLock { $0 = false }
+            return
         }
+
+        // Within hold window — extrapolate landmarks using filter-estimated velocity.
+        // dt = elapsed since last real frame; lastFrameTime intentionally NOT updated, so
+        // when a real frame returns, its dt covers the full gap (filter sees a single
+        // larger jump rather than several extrapolated micro-steps).
+        let now = CACurrentMediaTime()
+        let dt: Float = lastFrameTime == 0 ? Float(1.0/30.0) : Float(now - lastFrameTime)
+
+        let predicted: [SIMD2<Float>] = (0..<21).map { i in
+            SIMD2(oefX[i].lastValue + oefX[i].velocity * dt,
+                  oefY[i].lastValue + oefY[i].velocity * dt)
+        }
+
+        // Run joystick decision on predicted landmarks — keys stay live during dropout.
+        let (newKeys, vec, active) = computeKeys(predicted)
+        if newKeys != keys { keys = newKeys }
+        lastVec    = vec
+        lastActive = active
+        landmarks  = predicted
+
         inFlight.withLock { $0 = false }
     }
 
     @MainActor
     private func processLandmarks(_ raw: [SIMD2<Float>], size: CGSize, pipelineMs: Double = 0) {
-        noHandStreak = 0   // hand detected — reset hold counter
+        noHandStreak = 0
 
         pipeCount += 1
         pipeSumMs += pipelineMs
@@ -328,20 +426,21 @@ extension HandJoystick: AVCaptureVideoDataOutputSampleBufferDelegate {
             pipeCount = 0; pipeSumMs = 0; pipeMaxMs = 0
         }
 
-        let smoothed: [SIMD2<Float>]
-        if let prev = emaLandmarks, prev.count == raw.count {
-            let a = cfg.ema_alpha
-            smoothed = zip(prev, raw).map { p, r in a * p + (1 - a) * r }
-        } else {
-            smoothed = raw
+        // dt for 1€ filter — real elapsed time since last real frame. First frame uses 1/30s.
+        let now = CACurrentMediaTime()
+        let dt: Float = lastFrameTime == 0 ? Float(1.0/30.0) : Float(now - lastFrameTime)
+        lastFrameTime = now
+
+        let smoothed: [SIMD2<Float>] = (0..<21).map { i in
+            SIMD2(oefX[i].filter(raw[i].x, dt: dt),
+                  oefY[i].filter(raw[i].y, dt: dt))
         }
-        emaLandmarks = smoothed
 
         let (newKeys, vec, active) = computeKeys(smoothed)
         if newKeys != keys { keys = newKeys }
         lastVec    = vec
         lastActive = active
-        landmarks  = raw   // raw (unsmoothed) for overlay — no EMA lag
+        landmarks  = raw            // overlay shows raw — no smoothing lag visible
         frameSize  = size
 
         inFlight.withLock { $0 = false }
