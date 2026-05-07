@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.python-version
+
+# Vendored / third-party model code (too large for GitHub)
+attempt1/HandMesh/
+attempt1/hamer/
+attempt1/simpleHand/
+
+# Model checkpoints / weights
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.tflite
+*.h5
+
+# Generated images / large binaries
+attempt1/*.png
+attempt1/*.avif
+attempt1/*.jpg
+attempt1/*.jpeg
+out/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# macOS / Xcode
+.DS_Store
+**/xcuserdata/
+**/DerivedData/
+*.xcworkspace/xcuserdata/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# Plans / scratch
+.planning/

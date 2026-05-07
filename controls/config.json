@@ -1,0 +1,6 @@
+{
+  "camera": 0,
+  "ready_secs": 3.0,
+  "record_secs": 5.0,
+  "threshold": 0.35
+}
