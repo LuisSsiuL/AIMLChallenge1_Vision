@@ -21,15 +21,23 @@ import Vision
 // ── Public types ──────────────────────────────────────────────────────────────
 
 enum DrivingCommand: String {
-    case forward, turnLeft, reverse, turnRight, brake
+    case forward
+    case forwardLeft
+    case forwardRight
+    case reverse
+    case reverseLeft
+    case reverseRight
+    case brake
 
     var label: String {
         switch self {
-        case .forward:   return "^ FORWARD"
-        case .turnLeft:  return "< LEFT"
-        case .reverse:   return "v REVERSE"
-        case .turnRight: return "> RIGHT"
-        case .brake:     return "STOP"
+        case .forward:      return "^ FORWARD"
+        case .forwardLeft:  return "<^ FWD+LEFT"
+        case .forwardRight: return "^> FWD+RIGHT"
+        case .reverse:      return "v REVERSE"
+        case .reverseLeft:  return "<v REV+LEFT"
+        case .reverseRight: return "v> REV+RIGHT"
+        case .brake:        return "STOP"
         }
     }
 }
@@ -59,18 +67,20 @@ final class DepthDriver: ObservableObject {
     var left:     Bool { keys.contains(KeyboardMonitor.A) }
     var right:    Bool { keys.contains(KeyboardMonitor.D) }
 
-    // Tunables — match live_depth_mlmodel_wasd.py (simplified pipeline).
-    private let forwardThreshold:    Float = 150
-    private let reverseThreshold:    Float = 80
-    private let steerMinDiff:        Float = 10
+    // Tunables — live_depth_mlmodel_wasd 2.py (compound-command pipeline).
+    private let forwardThreshold:    Float = 120
+    private let stuckThreshold:      Float = 60
+    private let steerMinDiff:        Float = 15
+    private let hysteresisBonus:     Float = 10
     private let navRowStart:         Float = 0.30
-    private let cmdSmoothFrames:     Int   = 5
-    private let reverseEscapeFrames: Int   = 10
+    private let cmdSmoothFrames:     Int   = 3
+    private let reverseEscapeFrames: Int   = 8
 
-    // Perception state — no percentile-EMA, no floor baseline (dropped per new script).
+    // Perception state.
     private var consecutiveReverse = 0
     private var escapePhase = 0
     private var smoother: [DrivingCommand] = []
+    private var lastCommand: DrivingCommand = .brake   // for hysteresis bias
 
     // Model
     nonisolated(unsafe) private var model: MLModel?
@@ -134,6 +144,7 @@ final class DepthDriver: ObservableObject {
         consecutiveReverse = 0
         escapePhase = 0
         smoother.removeAll()
+        lastCommand = .brake
         inFlight.withLock { $0 = false }
     }
 
@@ -238,35 +249,22 @@ final class DepthDriver: ObservableObject {
         let z = computeZoneScores(depthU8: depthU8, w: w, h: h, rowStart: safeRow0)
         zones = z
 
-        // Decide command (decision tree with escape phase)
+        // Decide command (decision tree with escape phase + hysteresis)
         let raw = decideCommand(zones: z)
-        // After decideCommand, escapePhase != 0 means this turn was triggered by the
-        // reverse-stuck escape manoeuvre — turn while reversing instead of forward.
-        let inEscape = (escapePhase != 0)
         let smoothed = push(raw)
+        lastCommand = smoothed   // hysteresis input for next frame
         command = smoothed
         depthImage = preview
 
-        // Map command → keys.
-        // Sim has bike-model coupling: yaw rate scales with speed. Lone A/D at speed=0
-        // produces no rotation. Pair turns with throttle so the car can actually steer:
-        //   normal turn  → A/D + W   (turn while moving forward)
-        //   escape turn  → A/D + S   (turn while reversing — frees from corners)
+        // Compound commands map directly to multi-key sets.
         switch smoothed {
-        case .forward:
-            keys = [KeyboardMonitor.W]
-        case .reverse:
-            keys = [KeyboardMonitor.S]
-        case .turnLeft:
-            keys = inEscape
-                ? [KeyboardMonitor.A, KeyboardMonitor.S]
-                : [KeyboardMonitor.A, KeyboardMonitor.W]
-        case .turnRight:
-            keys = inEscape
-                ? [KeyboardMonitor.D, KeyboardMonitor.S]
-                : [KeyboardMonitor.D, KeyboardMonitor.W]
-        case .brake:
-            keys = []
+        case .forward:      keys = [KeyboardMonitor.W]
+        case .forwardLeft:  keys = [KeyboardMonitor.W, KeyboardMonitor.A]
+        case .forwardRight: keys = [KeyboardMonitor.W, KeyboardMonitor.D]
+        case .reverse:      keys = [KeyboardMonitor.S]
+        case .reverseLeft:  keys = [KeyboardMonitor.S, KeyboardMonitor.A]
+        case .reverseRight: keys = [KeyboardMonitor.S, KeyboardMonitor.D]
+        case .brake:        keys = []
         }
     }
 
@@ -290,7 +288,7 @@ final class DepthDriver: ObservableObject {
             let score = max(0, min(255, mean))
             let state: ZoneState
             if      score > forwardThreshold { state = .clear }
-            else if score < reverseThreshold { state = .blocked }
+            else if score < stuckThreshold   { state = .blocked }
             else                              { state = .uncertain }
             out.append(ZoneScore(name: names[i], meanDepth: mean, obstacleScore: score, state: state))
         }
@@ -300,50 +298,57 @@ final class DepthDriver: ObservableObject {
     @MainActor
     private func decideCommand(zones: [ZoneScore]) -> DrivingCommand {
         let fl = zones[0], l = zones[1], c = zones[2], r = zones[3], fr = zones[4]
-        let leftScore  = (fl.obstacleScore + l.obstacleScore) / 2.0
-        let rightScore = (fr.obstacleScore + r.obstacleScore) / 2.0
-        let bestScore  = [fl, l, c, r, fr].map(\.obstacleScore).max() ?? 0
 
-        // 1. Escape manoeuvre takes priority
+        // Weighted side scores: far zones count more (they show the path ahead).
+        var leftScore  = fl.obstacleScore * 0.6 + l.obstacleScore * 0.4
+        var rightScore = fr.obstacleScore * 0.6 + r.obstacleScore * 0.4
+
+        // Hysteresis: bias toward continuing current direction (anti-oscillation).
+        if lastCommand == .forwardLeft  { leftScore  += hysteresisBonus }
+        if lastCommand == .forwardRight { rightScore += hysteresisBonus }
+
+        let bestScore = [fl, l, c, r, fr].map(\.obstacleScore).max() ?? 0
+
+        // 1. Escape manoeuvre — reverse + steer to unstick.
         if escapePhase != 0 {
             if escapePhase > 0 {
                 escapePhase -= 1
                 if escapePhase == 0 { escapePhase = -5 }
-                return .turnLeft
+                return .reverseLeft
             } else {
                 escapePhase += 1
                 if escapePhase == 0 { return .forward }
-                return .turnRight
+                return .reverseRight
             }
         }
 
-        // 2. Everything too close → REVERSE, then escape
-        if bestScore < reverseThreshold {
+        // 2. Truly stuck (all zones very low) → REVERSE.
+        if bestScore < stuckThreshold {
             consecutiveReverse += 1
             if consecutiveReverse > reverseEscapeFrames {
                 consecutiveReverse = 0
                 if leftScore >= rightScore {
                     escapePhase = 5
-                    return .turnLeft
+                    return .reverseLeft
                 } else {
                     escapePhase = -5
-                    return .turnRight
+                    return .reverseRight
                 }
             }
             return .reverse
         }
         consecutiveReverse = 0
 
-        // 3. Center open → FORWARD
+        // 3. Center very open → FORWARD straight.
         if c.obstacleScore >= forwardThreshold { return .forward }
 
-        // 4. Steer toward higher-scoring side
-        if leftScore  > rightScore + steerMinDiff { return .turnLeft }
-        if rightScore > leftScore  + steerMinDiff { return .turnRight }
+        // 4. Center not ideal — steer while moving forward.
+        if leftScore  > rightScore + steerMinDiff { return .forwardLeft }
+        if rightScore > leftScore  + steerMinDiff { return .forwardRight }
 
-        // Tie-break with far zones
-        if fl.obstacleScore > fr.obstacleScore { return .turnLeft }
-        if fr.obstacleScore > fl.obstacleScore { return .turnRight }
+        // Tie-break with far zones (+5 margin to avoid jitter).
+        if fl.obstacleScore > fr.obstacleScore + 5 { return .forwardLeft }
+        if fr.obstacleScore > fl.obstacleScore + 5 { return .forwardRight }
 
         return .forward
     }

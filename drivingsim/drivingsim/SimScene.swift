@@ -153,20 +153,66 @@ final class SimScene {
 
         // ── Clutter bins / boxes — scattered in big open areas ────────────
         let binPositions: [(SIMD3<Float>, Float, Float, Float)] = [
-            ([-13.0, 0.20,  -8.0], 0.40, 0.40, 0.40),   // NW corner
-            ([ 13.0, 0.20,  -8.0], 0.40, 0.40, 0.40),   // NE corner
-            ([-13.0, 0.20,   8.0], 0.40, 0.40, 0.40),   // SW corner
-            ([ 13.0, 0.20,   8.0], 0.40, 0.40, 0.40),   // SE corner
-            ([ -6.0, 0.20,   0.0], 0.45, 0.45, 0.45),   // central aisle, west of centre
-            ([  6.0, 0.20,   0.0], 0.45, 0.45, 0.45),   // central aisle, east of centre
-            ([  0.0, 0.20,  -7.5], 0.50, 0.50, 0.50),   // between cabinets and north desks
-            ([ -8.0, 0.20,   7.0], 0.40, 0.40, 0.40),   // near south, west
-            ([  8.0, 0.20,   7.0], 0.40, 0.40, 0.40),   // near south, east
-            ([  0.0, 0.20,  -1.5], 0.40, 0.40, 0.40),   // central spot between desk rows
+            ([-13.0, 0.20,  -8.0], 0.40, 0.40, 0.40),
+            ([ 13.0, 0.20,  -8.0], 0.40, 0.40, 0.40),
+            ([-13.0, 0.20,   8.0], 0.40, 0.40, 0.40),
+            ([ 13.0, 0.20,   8.0], 0.40, 0.40, 0.40),
+            ([ -6.0, 0.20,   0.0], 0.45, 0.45, 0.45),
+            ([  6.0, 0.20,   0.0], 0.45, 0.45, 0.45),
+            ([  0.0, 0.20,  -7.5], 0.50, 0.50, 0.50),
+            ([ -8.0, 0.20,   7.0], 0.40, 0.40, 0.40),
+            ([  8.0, 0.20,   7.0], 0.40, 0.40, 0.40),
+            ([  0.0, 0.20,  -1.5], 0.40, 0.40, 0.40),
         ]
         for (i, p) in binPositions.enumerated() {
             addBox(at: p.0, w: p.1, h: p.2, d: p.3, color: binColors[i % binColors.count])
         }
+
+        // ── Extra furniture / structural obstacles ────────────────────────
+        let sofaColor       = NSColor(red: 0.30, green: 0.32, blue: 0.40, alpha: 1)  // dark blue-grey
+        let pillarColor     = NSColor(white: 0.65, alpha: 1)                          // light grey
+        let plantColor      = NSColor(red: 0.18, green: 0.45, blue: 0.22, alpha: 1)  // dark green
+        let cardboardColor  = NSColor(red: 0.62, green: 0.45, blue: 0.28, alpha: 1)  // cardboard brown
+        let printerColor    = NSColor(white: 0.30, alpha: 1)                          // dark grey
+        let coolerColor     = NSColor(red: 0.55, green: 0.75, blue: 0.85, alpha: 1)  // light blue
+        let whiteboardColor = NSColor(white: 0.95, alpha: 1)                          // white
+
+        // Long couches / benches against side walls (give the room more "stuff")
+        addBox(at: [-14.5, 0.40,  6.0], w: 0.6, h: 0.8, d: 2.5, color: sofaColor)   // west wall, south
+        addBox(at: [ 14.5, 0.40, -6.0], w: 0.6, h: 0.8, d: 2.5, color: sofaColor)   // east wall, north
+
+        // Interior structural pillars — flank the central aisle
+        addBox(at: [-7.0, 1.50,  0.0], w: 0.4, h: 3.0, d: 0.4, color: pillarColor)
+        addBox(at: [ 7.0, 1.50,  0.0], w: 0.4, h: 3.0, d: 0.4, color: pillarColor)
+
+        // Plants near the doorway (flanking the spawn corridor)
+        addBox(at: [-2.0, 0.50,  6.0], w: 0.4, h: 1.0, d: 0.4, color: plantColor)
+        addBox(at: [ 2.0, 0.50,  6.0], w: 0.4, h: 1.0, d: 0.4, color: plantColor)
+        // Plant in the north corridor between desks and cabinets
+        addBox(at: [ 0.0, 0.50, -5.5], w: 0.4, h: 1.0, d: 0.4, color: plantColor)
+
+        // Cardboard box stacks scattered in open zones
+        addBox(at: [-10.0, 0.50, -7.0], w: 0.5, h: 1.0, d: 0.5, color: cardboardColor)
+        addBox(at: [ 10.0, 0.50, -7.0], w: 0.5, h: 1.0, d: 0.5, color: cardboardColor)
+        addBox(at: [-11.0, 0.30,  3.5], w: 0.6, h: 0.6, d: 0.6, color: cardboardColor)
+        addBox(at: [ 11.0, 0.30,  3.5], w: 0.6, h: 0.6, d: 0.6, color: cardboardColor)
+
+        // Printer / copier (east side of north area)
+        addBox(at: [13.0, 0.40, -3.0], w: 0.6, h: 0.8, d: 0.5, color: printerColor)
+
+        // Water cooler (west side)
+        addBox(at: [-13.0, 0.55, 4.0], w: 0.4, h: 1.1, d: 0.4, color: coolerColor)
+
+        // Wall-mounted whiteboard — thin slab against west wall, north area
+        addBox(at: [-14.85, 1.25, -3.0], w: 0.10, h: 1.5, d: 2.0, color: whiteboardColor)
+
+        // Filing cabinets — extra storage along east wall
+        addBox(at: [14.5, 0.60, -2.0], w: 0.5, h: 1.2, d: 0.5, color: cabinetColor)
+        addBox(at: [14.5, 0.60,  2.0], w: 0.5, h: 1.2, d: 0.5, color: cabinetColor)
+
+        // Tall plants in the corners (visual richness, fills depth scene)
+        addBox(at: [-13.5, 0.75, -5.0], w: 0.5, h: 1.5, d: 0.5, color: plantColor)
+        addBox(at: [ 13.5, 0.75,  6.0], w: 0.5, h: 1.5, d: 0.5, color: plantColor)
     }
 
     /// Add a box-shaped obstacle. UnlitMaterial = no specular, no reflection,
