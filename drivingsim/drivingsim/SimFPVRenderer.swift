@@ -91,7 +91,7 @@ final class SimFPVRenderer {
             let mesh = MeshResource.generateBox(width: o.halfX * 2,
                                                 height: o.height,
                                                 depth: o.halfZ * 2)
-            let mat  = SimpleMaterial(color: .systemGray, isMetallic: false)
+            let mat  = UnlitMaterial(color: NSColor(white: 0.55, alpha: 1))
             let ent  = ModelEntity(mesh: mesh, materials: [mat])
             ent.position = o.pos
             renderer.entities.append(ent)
@@ -100,7 +100,7 @@ final class SimFPVRenderer {
         // Car proxy — anchor for camera; not rendered (clear material, tiny).
         let proxyMesh = MeshResource.generateSphere(radius: 0.001)
         carProxy = ModelEntity(mesh: proxyMesh,
-                               materials: [SimpleMaterial(color: .clear, isMetallic: false)])
+                               materials: [UnlitMaterial(color: .clear)])
         carProxy.position = [0, 0.5, 0]
         renderer.entities.append(carProxy)
 

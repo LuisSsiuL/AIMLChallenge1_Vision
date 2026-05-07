@@ -18,12 +18,12 @@ final class SimScene {
     private var cam: PerspectiveCamera!
 
     // Car tunables — RC-car scale, indoor speeds.
-    private let maxSpeed:      Float = 1.5    // ~5.4 km/h, slow indoor RC
-    private let accel:         Float = 1.0
-    private let brakeDecel:    Float = 2.0
-    private let coastDrag:     Float = 1.0
-    private let maxSteerRate:  Float = 1.6
-    private let steerSpeedRef: Float = 0.5    // full steer at lower speed (small car)
+    private let maxSpeed:      Float = 3.0    // ~11 km/h, brisk indoor RC
+    private let accel:         Float = 2.0
+    private let brakeDecel:    Float = 4.0
+    private let coastDrag:     Float = 1.5
+    private let maxSteerRate:  Float = 1.8
+    private let steerSpeedRef: Float = 0.8    // full steer at low speed
 
     // FPV camera — RC car eye-line ~6cm above floor.
     private let eyeHeight:     Float = 0.06
@@ -71,105 +71,109 @@ final class SimScene {
 
     private func addGround() {
         // Big outdoor ground — visible through the doorway, suggests the office is on a lawn.
-        let groundSize: Float = 60
+        let groundSize: Float = 200
         let groundMesh = MeshResource.generateBox(width: groundSize, height: 0.02, depth: groundSize)
         let groundMat  = UnlitMaterial(color: NSColor(red: 0.30, green: 0.42, blue: 0.30, alpha: 1))
         let ground     = ModelEntity(mesh: groundMesh, materials: [groundMat])
         ground.position = [0, -0.011, 0]
         root.addChild(ground)
 
-        // Wood floor inside the office (visual cue only — not a collider).
-        let floorMat = UnlitMaterial(color: NSColor(red: 0.60, green: 0.45, blue: 0.30, alpha: 1))
-        let floorMesh = MeshResource.generateBox(width: 6.0, height: 0.005, depth: 4.0)
+        // Office floor (large open-plan, wood-tone, fully unlit so no reflections).
+        let floorMat = UnlitMaterial(color: NSColor(red: 0.55, green: 0.42, blue: 0.30, alpha: 1))
+        let floorMesh = MeshResource.generateBox(width: 30.0, height: 0.005, depth: 20.0)
         let floor = ModelEntity(mesh: floorMesh, materials: [floorMat])
         floor.position = [0, 0.003, 0]
         root.addChild(floor)
     }
 
     private func setupOfficeRoom() {
-        // Room: 6m W × 4m D × 2.5m H, centred on origin.
-        // South wall has a 2m doorway centred at x=0.
-        let wallH: Float = 2.5
-        let wallT: Float = 0.10   // wall thickness
-        let roomW: Float = 6.0
-        let roomD: Float = 4.0
+        // Open-plan office: 30m W × 20m D × 3m H, centred on origin.
+        // South wall has a 4m doorway centred at x=0.
+        let wallH: Float = 3.0
+        let wallT: Float = 0.15
+        let roomW: Float = 30.0
+        let roomD: Float = 20.0
         let halfW = roomW / 2
         let halfD = roomD / 2
 
-        let wallColor    = NSColor(red: 0.72, green: 0.78, blue: 0.82, alpha: 1)
-        let cabinetColor = NSColor(white: 0.78, alpha: 1)
-        let deskColor    = NSColor(red: 0.40, green: 0.26, blue: 0.16, alpha: 1)
-        let chairColor   = NSColor(white: 0.18, alpha: 1)
-        let binColors: [NSColor] = [.systemRed, .systemBlue, .systemOrange, .systemTeal, .systemYellow]
+        let wallColor    = NSColor(red: 0.78, green: 0.80, blue: 0.82, alpha: 1)
+        let cabinetColor = NSColor(white: 0.72, alpha: 1)
+        let deskColor    = NSColor(red: 0.42, green: 0.28, blue: 0.18, alpha: 1)
+        let chairColor   = NSColor(white: 0.20, alpha: 1)
+        let binColors: [NSColor] = [
+            NSColor(red: 0.75, green: 0.30, blue: 0.30, alpha: 1),  // muted red
+            NSColor(red: 0.30, green: 0.45, blue: 0.70, alpha: 1),  // muted blue
+            NSColor(red: 0.80, green: 0.60, blue: 0.25, alpha: 1),  // muted orange
+            NSColor(red: 0.30, green: 0.65, blue: 0.55, alpha: 1),  // muted teal
+            NSColor(red: 0.55, green: 0.50, blue: 0.30, alpha: 1),  // muted olive
+        ]
 
         // ── Walls ─────────────────────────────────────────────────────────
-        // North wall (z = -halfD)
         addBox(at: [0, wallH/2, -halfD - wallT/2], w: roomW + wallT*2, h: wallH, d: wallT, color: wallColor)
-        // East wall (x = +halfW)
-        addBox(at: [halfW + wallT/2, wallH/2, 0], w: wallT, h: wallH, d: roomD, color: wallColor)
-        // West wall (x = -halfW)
+        addBox(at: [halfW + wallT/2, wallH/2, 0],  w: wallT, h: wallH, d: roomD, color: wallColor)
         addBox(at: [-halfW - wallT/2, wallH/2, 0], w: wallT, h: wallH, d: roomD, color: wallColor)
-        // South wall — split for 2m doorway centred at x=0.
-        let doorHalf: Float = 1.0
+        // South wall — 4m doorway centred at x=0.
+        let doorHalf: Float = 2.0
         let southSegW = halfW - doorHalf
         addBox(at: [-halfW + southSegW/2, wallH/2, halfD + wallT/2], w: southSegW, h: wallH, d: wallT, color: wallColor)
         addBox(at: [ halfW - southSegW/2, wallH/2, halfD + wallT/2], w: southSegW, h: wallH, d: wallT, color: wallColor)
 
-        // ── Cabinets along north wall (just inside) ───────────────────────
+        // ── Cabinets along north wall (6, evenly spaced) ──────────────────
         let cabH: Float = 1.8
         let cabD: Float = 0.50
-        let cabW: Float = 1.0
-        let cabZ: Float = -halfD + cabD/2 + 0.05
-        for x in stride(from: -2.0 as Float, through: 2.0, by: 2.0) {
+        let cabW: Float = 1.2
+        let cabZ: Float = -halfD + cabD/2 + 0.10
+        for x in stride(from: -10.0 as Float, through: 10.0, by: 4.0) {
             addBox(at: [x, cabH/2, cabZ], w: cabW, h: cabH, d: cabD, color: cabinetColor)
         }
 
-        // ── Desks: 2 rows of 3 ───────────────────────────────────────────
+        // ── Desk pods: 2 rows of 4 desks each, wide aisles ────────────────
         let deskH: Float = 0.75
         let deskW: Float = 1.5
         let deskD: Float = 0.70
-        // North row (closer to cabinets)
-        let northRowZ: Float = -0.6
-        for x in stride(from: -2.0 as Float, through: 2.0, by: 2.0) {
-            addBox(at: [x, deskH/2, northRowZ], w: deskW, h: deskH, d: deskD, color: deskColor)
-        }
-        // South row
-        let southRowZ: Float = 0.6
-        for x in stride(from: -2.0 as Float, through: 2.0, by: 2.0) {
-            addBox(at: [x, deskH/2, southRowZ], w: deskW, h: deskH, d: deskD, color: deskColor)
-        }
-
-        // ── Chairs (5 — skip centre south-row chair for car spawn safety) ─
         let chairH: Float = 0.95
-        let chairS: Float = 0.50   // square footprint
-        let northChairZ: Float = northRowZ + deskD/2 + 0.30 + chairS/2   // ~ -0.05
-        for x in stride(from: -2.0 as Float, through: 2.0, by: 2.0) {
-            addBox(at: [x, chairH/2, northChairZ], w: chairS, h: chairH, d: chairS, color: chairColor)
-        }
-        let southChairZ: Float = southRowZ + deskD/2 + 0.30 + chairS/2   // ~ 1.20
-        for x in [-2.0 as Float, 2.0] {  // skip x=0 — leave aisle for car
-            addBox(at: [x, chairH/2, southChairZ], w: chairS, h: chairH, d: chairS, color: chairColor)
+        let chairS: Float = 0.50
+
+        let deskRowZs: [Float] = [-3.5, 3.5]      // 7m apart, big central aisle
+        let deskColX: [Float]  = [-9, -3, 3, 9]   // 4 desks per row, ~6m spacing
+
+        for rowZ in deskRowZs {
+            for x in deskColX {
+                addBox(at: [x, deskH/2, rowZ], w: deskW, h: deskH, d: deskD, color: deskColor)
+            }
         }
 
-        // ── Clutter bins / boxes (5 scattered, avoiding everything above) ─
-        // Hand-picked clear positions:
+        // Chairs in front of each desk (skip nothing — spawn is far from these).
+        for rowZ in deskRowZs {
+            let chairZ = rowZ + deskD/2 + 0.30 + chairS/2   // 0.40m forward of desk
+            for x in deskColX {
+                addBox(at: [x, chairH/2, chairZ], w: chairS, h: chairH, d: chairS, color: chairColor)
+            }
+        }
+
+        // ── Clutter bins / boxes — scattered in big open areas ────────────
         let binPositions: [(SIMD3<Float>, Float, Float, Float)] = [
-            // (centre, w, h, d)
-            ([-2.6, 0.20, 0.0],  0.30, 0.40, 0.30),   // west aisle, between rows
-            ([ 2.6, 0.20, 0.0],  0.30, 0.40, 0.30),   // east aisle
-            ([-2.6, 0.20, -1.2], 0.30, 0.40, 0.30),   // west, between cabinet and desk row
-            ([ 2.6, 0.20, -1.2], 0.30, 0.40, 0.30),   // east, between cabinet and desk row
-            ([ 0.0, 0.15, -1.85], 0.40, 0.30, 0.40),  // small box pushed against north cabinets
+            ([-13.0, 0.20,  -8.0], 0.40, 0.40, 0.40),   // NW corner
+            ([ 13.0, 0.20,  -8.0], 0.40, 0.40, 0.40),   // NE corner
+            ([-13.0, 0.20,   8.0], 0.40, 0.40, 0.40),   // SW corner
+            ([ 13.0, 0.20,   8.0], 0.40, 0.40, 0.40),   // SE corner
+            ([ -6.0, 0.20,   0.0], 0.45, 0.45, 0.45),   // central aisle, west of centre
+            ([  6.0, 0.20,   0.0], 0.45, 0.45, 0.45),   // central aisle, east of centre
+            ([  0.0, 0.20,  -7.5], 0.50, 0.50, 0.50),   // between cabinets and north desks
+            ([ -8.0, 0.20,   7.0], 0.40, 0.40, 0.40),   // near south, west
+            ([  8.0, 0.20,   7.0], 0.40, 0.40, 0.40),   // near south, east
+            ([  0.0, 0.20,  -1.5], 0.40, 0.40, 0.40),   // central spot between desk rows
         ]
         for (i, p) in binPositions.enumerated() {
             addBox(at: p.0, w: p.1, h: p.2, d: p.3, color: binColors[i % binColors.count])
         }
     }
 
-    /// Add a box-shaped obstacle: registers visual entity AND AABB collision record.
+    /// Add a box-shaped obstacle. UnlitMaterial = no specular, no reflection,
+    /// flat-shaded — gives the depth model clean inputs and avoids highlights.
     private func addBox(at pos: SIMD3<Float>, w: Float, h: Float, d: Float, color: NSColor) {
         let mesh = MeshResource.generateBox(width: w, height: h, depth: d)
-        let mat  = SimpleMaterial(color: color, isMetallic: false)
+        let mat  = UnlitMaterial(color: color)
         let ent  = ModelEntity(mesh: mesh, materials: [mat])
         ent.position = pos
         root.addChild(ent)
@@ -179,9 +183,9 @@ final class SimScene {
     private func addCar() {
         // Tiny invisible proxy — FPV camera sits above, car body never visually rendered.
         let carMesh = MeshResource.generateSphere(radius: 0.001)
-        car = ModelEntity(mesh: carMesh, materials: [SimpleMaterial(color: .clear, isMetallic: false)])
-        // Spawn near south doorway (z = +1.8), facing -Z (into the room).
-        car.position    = [0, carBodyY, 1.8]
+        car = ModelEntity(mesh: carMesh, materials: [UnlitMaterial(color: .clear)])
+        // Spawn just inside south doorway, facing -Z (into the office).
+        car.position    = [0, carBodyY, 9.0]
         car.orientation = simd_quatf(angle: 0, axis: [0, 1, 0])
         yaw = 0
         root.addChild(car)
@@ -201,7 +205,7 @@ final class SimScene {
     private func addCamera() {
         cam = PerspectiveCamera()
         cam.camera.fieldOfViewInDegrees = 75
-        cam.position = [0, carBodyY + eyeHeight, 1.8]
+        cam.position = [0, carBodyY + eyeHeight, 9.0]
         cam.look(at: [0, carBodyY + eyeHeight, -1], from: cam.position, relativeTo: nil)
         root.addChild(cam)
     }
