@@ -45,9 +45,10 @@ _DEFAULTS = {
     "deadzone_x":      0.14,
     "deadzone_y_neg":  0.006,
     "deadzone_y_pos":  0.120,
-    "ema_alpha":       0.50,
+    "ema_alpha":       0.30,
     "fist_dist":       0.65,
     "extension_ratio": 1.3,
+    "hold_frames":     4,     # Swift temporal hold — Python ignores but keeps config canonical
 }
 
 def _load_config():
