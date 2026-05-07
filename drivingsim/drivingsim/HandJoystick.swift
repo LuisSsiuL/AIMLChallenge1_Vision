@@ -87,6 +87,11 @@ final class HandJoystick: NSObject, ObservableObject {
 
     private var emaLandmarks: [SIMD2<Float>]?      // 21 smoothed pixel landmarks
 
+    // ── MainActor pipeline stats (stored here — extensions can't hold stored properties) ──
+    private var pipeCount = 0
+    private var pipeSumMs = 0.0
+    private var pipeMaxMs = 0.0
+
     // ── timing stats (vision-queue writes, logged every statInterval frames) ──
     nonisolated(unsafe) private var statFrames     = 0
     nonisolated(unsafe) private var statDetected   = 0
@@ -281,11 +286,6 @@ extension HandJoystick: AVCaptureVideoDataOutputSampleBufferDelegate {
         emaLandmarks = nil
         if !landmarks.isEmpty { landmarks = [] }
     }
-
-    // MainActor-side pipeline stats
-    private var pipeCount  = 0
-    private var pipeSumMs  = 0.0
-    private var pipeMaxMs  = 0.0
 
     @MainActor
     private func processLandmarks(_ raw: [SIMD2<Float>], size: CGSize, pipelineMs: Double = 0) {
