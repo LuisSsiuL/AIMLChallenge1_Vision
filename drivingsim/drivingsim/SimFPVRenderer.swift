@@ -78,20 +78,21 @@ final class SimFPVRenderer {
         }
 
         // Build the parallel scene: ground, obstacles, car proxy, camera, lights.
-        let groundMat   = UnlitMaterial(color: NSColor(red: 0.25, green: 0.38, blue: 0.25, alpha: 1))
+        // Matte diffuse materials (roughness=1.0) — depth model gets shading +
+        // cast shadows for stronger geometric cues than flat unlit colours.
+        let groundMat   = SimpleMaterial(color: NSColor(red: 0.55, green: 0.42, blue: 0.30, alpha: 1),
+                                          roughness: 1.0, isMetallic: false)
         let groundMesh  = MeshResource.generateBox(width: 500, height: 0.1, depth: 500)
         let ground      = ModelEntity(mesh: groundMesh, materials: [groundMat])
         ground.position = [0, -0.05, 0]
         renderer.entities.append(ground)
 
         for o in obstacles {
-            // We don't know the exact w/d (only halfX/halfZ which encode collision AABB
-            // post-rotation). Build a box matching the AABB — depth model only needs
-            // approximate occupancy, not visual fidelity.
             let mesh = MeshResource.generateBox(width: o.halfX * 2,
                                                 height: o.height,
                                                 depth: o.halfZ * 2)
-            let mat  = UnlitMaterial(color: NSColor(white: 0.55, alpha: 1))
+            let mat  = SimpleMaterial(color: NSColor(white: 0.55, alpha: 1),
+                                       roughness: 1.0, isMetallic: false)
             let ent  = ModelEntity(mesh: mesh, materials: [mat])
             ent.position = o.pos
             renderer.entities.append(ent)
@@ -100,7 +101,7 @@ final class SimFPVRenderer {
         // Car proxy — anchor for camera; not rendered (clear material, tiny).
         let proxyMesh = MeshResource.generateSphere(radius: 0.001)
         carProxy = ModelEntity(mesh: proxyMesh,
-                               materials: [UnlitMaterial(color: .clear)])
+                               materials: [SimpleMaterial(color: .clear, isMetallic: false)])
         carProxy.position = [0, 0.5, 0]
         renderer.entities.append(carProxy)
 
@@ -113,10 +114,12 @@ final class SimFPVRenderer {
         renderer.activeCamera = cam
         self.fpvCamera = cam
 
-        // Lights.
+        // Lights — key casts shadows so depth model sees furniture casting
+        // onto floor + walls. Fill is shadowless to soften ambient.
         let key = DirectionalLight()
         key.light.intensity = 8000
         key.orientation = simd_quatf(angle: -.pi / 4, axis: [1, 0, 0])
+        key.shadow = DirectionalLightComponent.Shadow()
         renderer.entities.append(key)
         let fill = DirectionalLight()
         fill.light.intensity = 2500

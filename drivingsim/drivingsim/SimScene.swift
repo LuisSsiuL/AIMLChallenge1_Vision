@@ -72,16 +72,18 @@ final class SimScene {
     }
 
     private func addGround() {
-        // Big outdoor ground — visible through the doorway, suggests the office is on a lawn.
+        // Outdoor ground (visible through doorway). Matte diffuse — receives shadows.
         let groundSize: Float = 200
         let groundMesh = MeshResource.generateBox(width: groundSize, height: 0.02, depth: groundSize)
-        let groundMat  = UnlitMaterial(color: NSColor(red: 0.30, green: 0.42, blue: 0.30, alpha: 1))
+        let groundMat  = SimpleMaterial(color: NSColor(red: 0.30, green: 0.42, blue: 0.30, alpha: 1),
+                                         roughness: 1.0, isMetallic: false)
         let ground     = ModelEntity(mesh: groundMesh, materials: [groundMat])
         ground.position = [0, -0.011, 0]
         root.addChild(ground)
 
-        // Office floor (large open-plan, wood-tone, fully unlit so no reflections).
-        let floorMat = UnlitMaterial(color: NSColor(red: 0.55, green: 0.42, blue: 0.30, alpha: 1))
+        // Office floor — matte wood-tone, receives furniture shadows.
+        let floorMat = SimpleMaterial(color: NSColor(red: 0.55, green: 0.42, blue: 0.30, alpha: 1),
+                                       roughness: 1.0, isMetallic: false)
         let floorMesh = MeshResource.generateBox(width: 30.0, height: 0.005, depth: 20.0)
         let floor = ModelEntity(mesh: floorMesh, materials: [floorMat])
         floor.position = [0, 0.003, 0]
@@ -217,11 +219,12 @@ final class SimScene {
         addBox(at: [ 13.5, 0.75,  6.0], w: 0.5, h: 1.5, d: 0.5, color: plantColor)
     }
 
-    /// Add a box-shaped obstacle. UnlitMaterial = no specular, no reflection,
-    /// flat-shaded — gives the depth model clean inputs and avoids highlights.
+    /// Add a box-shaped obstacle. Matte diffuse (roughness=1.0) — no specular
+    /// highlights, no environment reflection, but DOES respond to lights so
+    /// the depth model sees proper shading + cast shadows.
     private func addBox(at pos: SIMD3<Float>, w: Float, h: Float, d: Float, color: NSColor) {
         let mesh = MeshResource.generateBox(width: w, height: h, depth: d)
-        let mat  = UnlitMaterial(color: color)
+        let mat  = SimpleMaterial(color: color, roughness: 1.0, isMetallic: false)
         let ent  = ModelEntity(mesh: mesh, materials: [mat])
         ent.position = pos
         root.addChild(ent)
@@ -240,10 +243,15 @@ final class SimScene {
     }
 
     private func addLights() {
+        // Key light — enable shadow casting so furniture casts onto floor/walls.
+        // Depth model gets stronger geometric cues from cast shadows.
         let key = DirectionalLight()
         key.light.intensity = 6000
         key.orientation = simd_quatf(angle: -.pi / 4, axis: [1, 0, 0])
+        key.shadow = DirectionalLightComponent.Shadow()
         root.addChild(key)
+
+        // Fill light — no shadows (avoids double-shadow artefacts, fills ambient).
         let fill = DirectionalLight()
         fill.light.intensity = 2500
         fill.orientation = simd_quatf(angle: .pi / 5, axis: [-1, 0, 0])
