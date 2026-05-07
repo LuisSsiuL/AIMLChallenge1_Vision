@@ -80,7 +80,7 @@ RealityKit FPV sim used to develop and test gesture control before deploying to 
 
 ```
 drivingsim/drivingsim/
-├── SimScene.swift          # FPV scene: 120 procedural rubble obstacles, AABB collision; tick() gates inputs by mode
+├── SimScene.swift          # FPV scene: procedural office room (6m×4m, walls/desks/chairs/cabinets/clutter, ~24 obstacles) at RC-car scale (15×20cm car, 6cm eye-height, 1.5m/s max), AABB collision; tick() gates inputs by mode
 ├── ContentView.swift       # SwiftUI root: mode picker (Off/Hand/Assisted/Auto), hand + depth previews, key-cap HUD
 ├── DrivingMode.swift       # enum Off/Hand/Assisted/Auto + needsHand/needsDepth helpers
 ├── HandJoystick.swift      # Native Vision hand gesture driver (see below)

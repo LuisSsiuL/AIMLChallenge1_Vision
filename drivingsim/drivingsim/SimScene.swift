@@ -2,8 +2,8 @@
 //  SimScene.swift
 //  drivingsim
 //
-//  FPV driving sim. Car translates + rotates in world space each frame;
-//  camera is a child of car entity — inherits yaw automatically, no per-tick math.
+//  Indoor office room sim at small-RC-car scale (~15×20cm car, FPV camera ~6cm
+//  above floor). Procedural — no external assets.
 //
 
 import AppKit
@@ -17,23 +17,28 @@ final class SimScene {
     private(set) var car: ModelEntity!
     private var cam: PerspectiveCamera!
 
-    // Car tunables
-    private let maxSpeed:      Float = 7
-    private let accel:         Float = 4
-    private let brakeDecel:    Float = 8
-    private let coastDrag:     Float = 3
+    // Car tunables — RC-car scale, indoor speeds.
+    private let maxSpeed:      Float = 1.5    // ~5.4 km/h, slow indoor RC
+    private let accel:         Float = 1.0
+    private let brakeDecel:    Float = 2.0
+    private let coastDrag:     Float = 1.0
     private let maxSteerRate:  Float = 1.6
-    private let steerSpeedRef: Float = 2
+    private let steerSpeedRef: Float = 0.5    // full steer at lower speed (small car)
 
-    // FPV camera tunables
-    private let eyeHeight:     Float = 1.2   // camera height above car center
-    private let eyeForward:    Float = 0.0   // forward offset along car -Z
+    // FPV camera — RC car eye-line ~6cm above floor.
+    private let eyeHeight:     Float = 0.06
+    private let eyeForward:    Float = 0.0
+
+    // Car AABB (15cm wide, 20cm long).
+    private let carHalfX: Float = 0.075
+    private let carHalfZ: Float = 0.10
+    private let carBodyY: Float = 0.03   // centre of car body above floor
 
     // State
     private var speed: Float = 0
     private var yaw:   Float = 0
 
-    // Procedural obstacles — single source of truth for render + collision
+    // Obstacles — single source of truth for render + collision.
     private struct Obstacle { let pos: SIMD3<Float>; let halfX: Float; let halfZ: Float; let height: Float }
     private var obstacles: [Obstacle] = []
 
@@ -42,12 +47,8 @@ final class SimScene {
         obstacles.map { ($0.pos, $0.halfX, $0.halfZ, $0.height) }
     }
 
-    /// Eye height — exposed so SimFPVRenderer matches the on-screen FPV camera.
     var eyeHeightPublic: Float { eyeHeight }
-
-    /// Current car position (world). For SimFPVRenderer per-frame camera sync.
     var carWorldPosition: SIMD3<Float> { car?.position ?? .zero }
-    /// Current car yaw (radians).
     var carYaw: Float { yaw }
 
     private var timer: Timer?
@@ -58,128 +59,154 @@ final class SimScene {
         return s
     }
 
+    // MARK: - Scene setup
+
     private func setup() {
-        // Ground
-        let groundSize: Float = 500
-        let groundMesh  = MeshResource.generateBox(width: groundSize, height: 0.1, depth: groundSize)
-        let groundMat   = UnlitMaterial(color: NSColor(red: 0.25, green: 0.38, blue: 0.25, alpha: 1))
-        let ground      = ModelEntity(mesh: groundMesh, materials: [groundMat])
-        ground.position = [0, -0.05, 0]
+        addGround()
+        setupOfficeRoom()
+        addCar()
+        addLights()
+        addCamera()
+    }
+
+    private func addGround() {
+        // Big outdoor ground — visible through the doorway, suggests the office is on a lawn.
+        let groundSize: Float = 60
+        let groundMesh = MeshResource.generateBox(width: groundSize, height: 0.02, depth: groundSize)
+        let groundMat  = UnlitMaterial(color: NSColor(red: 0.30, green: 0.42, blue: 0.30, alpha: 1))
+        let ground     = ModelEntity(mesh: groundMesh, materials: [groundMat])
+        ground.position = [0, -0.011, 0]
         root.addChild(ground)
 
-        // Grid lines every 10 m, ±100 m around origin
-        let gridMat    = UnlitMaterial(color: NSColor(white: 0.9, alpha: 1))
-        let gridExtent: Float = 100
-        let gridStep:   Float = 10
-        let lineThick:  Float = 0.10
-        let lineLen     = gridExtent * 2
-        let lineMeshX  = MeshResource.generateBox(width: lineLen,   height: 0.02, depth: lineThick)
-        let lineMeshZ  = MeshResource.generateBox(width: lineThick, height: 0.02, depth: lineLen)
-        var z = -gridExtent
-        while z <= gridExtent {
-            let l = ModelEntity(mesh: lineMeshX, materials: [gridMat])
-            l.position = [0, 0.012, z]; root.addChild(l)
-            z += gridStep
-        }
-        var x = -gridExtent
-        while x <= gridExtent {
-            let l = ModelEntity(mesh: lineMeshZ, materials: [gridMat])
-            l.position = [x, 0.012, 0]; root.addChild(l)
-            x += gridStep
-        }
+        // Wood floor inside the office (visual cue only — not a collider).
+        let floorMat = UnlitMaterial(color: NSColor(red: 0.60, green: 0.45, blue: 0.30, alpha: 1))
+        let floorMesh = MeshResource.generateBox(width: 6.0, height: 0.005, depth: 4.0)
+        let floor = ModelEntity(mesh: floorMesh, materials: [floorMat])
+        floor.position = [0, 0.003, 0]
+        root.addChild(floor)
+    }
 
-        // Procedural rubble obstacles — 120 mixed-size boxes
-        let colors: [NSColor] = [.systemBlue, .systemYellow, .systemOrange, .systemPurple, .systemTeal, .systemPink,
-                                  .systemBrown, .systemGray, .systemRed, .systemGreen]
-        let obstacleCount = 120
-        let spawnRadius:  Float = 80.0
-        let safeZone:     Float = 5.0    // clear area around car spawn
+    private func setupOfficeRoom() {
+        // Room: 6m W × 4m D × 2.5m H, centred on origin.
+        // South wall has a 2m doorway centred at x=0.
+        let wallH: Float = 2.5
+        let wallT: Float = 0.10   // wall thickness
+        let roomW: Float = 6.0
+        let roomD: Float = 4.0
+        let halfW = roomW / 2
+        let halfD = roomD / 2
 
-        var rng = SystemRandomNumberGenerator()
-        func frand(_ lo: Float, _ hi: Float) -> Float {
-            Float.random(in: lo...hi, using: &rng)
-        }
+        let wallColor    = NSColor(red: 0.72, green: 0.78, blue: 0.82, alpha: 1)
+        let cabinetColor = NSColor(white: 0.78, alpha: 1)
+        let deskColor    = NSColor(red: 0.40, green: 0.26, blue: 0.16, alpha: 1)
+        let chairColor   = NSColor(white: 0.18, alpha: 1)
+        let binColors: [NSColor] = [.systemRed, .systemBlue, .systemOrange, .systemTeal, .systemYellow]
 
-        // Obstacle archetype roll: small rubble, medium boxes, big boulders, walls
-        // Weighted: 45% small, 30% medium, 15% big, 10% wall
-        for i in 0..<obstacleCount {
-            var ox: Float
-            var oz: Float
-            repeat {
-                ox = frand(-spawnRadius, spawnRadius)
-                oz = frand(-spawnRadius, spawnRadius)
-            } while abs(ox) < safeZone && abs(oz) < safeZone
+        // ── Walls ─────────────────────────────────────────────────────────
+        // North wall (z = -halfD)
+        addBox(at: [0, wallH/2, -halfD - wallT/2], w: roomW + wallT*2, h: wallH, d: wallT, color: wallColor)
+        // East wall (x = +halfW)
+        addBox(at: [halfW + wallT/2, wallH/2, 0], w: wallT, h: wallH, d: roomD, color: wallColor)
+        // West wall (x = -halfW)
+        addBox(at: [-halfW - wallT/2, wallH/2, 0], w: wallT, h: wallH, d: roomD, color: wallColor)
+        // South wall — split for 2m doorway centred at x=0.
+        let doorHalf: Float = 1.0
+        let southSegW = halfW - doorHalf
+        addBox(at: [-halfW + southSegW/2, wallH/2, halfD + wallT/2], w: southSegW, h: wallH, d: wallT, color: wallColor)
+        addBox(at: [ halfW - southSegW/2, wallH/2, halfD + wallT/2], w: southSegW, h: wallH, d: wallT, color: wallColor)
 
-            let roll = frand(0, 1)
-            var w: Float, d: Float, h: Float
-
-            if roll < 0.45 {
-                // small rubble
-                w = frand(0.4, 1.5)
-                d = frand(0.4, 1.5)
-                h = frand(0.5, 2.0)
-            } else if roll < 0.75 {
-                // medium box
-                w = frand(1.5, 3.0)
-                d = frand(1.5, 3.0)
-                h = frand(2.0, 5.0)
-            } else if roll < 0.90 {
-                // big boulder / debris pile
-                w = frand(3.0, 6.0)
-                d = frand(3.0, 6.0)
-                h = frand(4.0, 9.0)
-            } else {
-                // wall — long on one axis
-                let longAxisX = Bool.random(using: &rng)
-                let longLen   = frand(8.0, 18.0)
-                let shortLen  = frand(0.4, 1.2)
-                w = longAxisX ? longLen  : shortLen
-                d = longAxisX ? shortLen : longLen
-                h = frand(2.5, 5.5)
-            }
-
-            // Quantized yaw: 0° or 90° only, so AABB collision stays honest.
-            // (Free rotation needs OBB collision; over-approx caused invisible walls.)
-            let rotateNinety = Bool.random(using: &rng)
-            let rot: Float = rotateNinety ? .pi / 2 : 0
-            let collHalfX = rotateNinety ? d / 2 : w / 2
-            let collHalfZ = rotateNinety ? w / 2 : d / 2
-
-            let pos = SIMD3<Float>(ox, h / 2, oz)
-            let mesh = MeshResource.generateBox(width: w, height: h, depth: d)
-            let mat  = SimpleMaterial(color: colors[i % colors.count], isMetallic: false)
-            let ent  = ModelEntity(mesh: mesh, materials: [mat])
-            ent.position    = pos
-            ent.orientation = simd_quatf(angle: rot, axis: [0, 1, 0])
-            root.addChild(ent)
-
-            obstacles.append(Obstacle(pos: pos, halfX: collHalfX, halfZ: collHalfZ, height: h))
+        // ── Cabinets along north wall (just inside) ───────────────────────
+        let cabH: Float = 1.8
+        let cabD: Float = 0.50
+        let cabW: Float = 1.0
+        let cabZ: Float = -halfD + cabD/2 + 0.05
+        for x in stride(from: -2.0 as Float, through: 2.0, by: 2.0) {
+            addBox(at: [x, cabH/2, cabZ], w: cabW, h: cabH, d: cabD, color: cabinetColor)
         }
 
-        // Car — tiny invisible mesh (FPV: not rendered visibly)
+        // ── Desks: 2 rows of 3 ───────────────────────────────────────────
+        let deskH: Float = 0.75
+        let deskW: Float = 1.5
+        let deskD: Float = 0.70
+        // North row (closer to cabinets)
+        let northRowZ: Float = -0.6
+        for x in stride(from: -2.0 as Float, through: 2.0, by: 2.0) {
+            addBox(at: [x, deskH/2, northRowZ], w: deskW, h: deskH, d: deskD, color: deskColor)
+        }
+        // South row
+        let southRowZ: Float = 0.6
+        for x in stride(from: -2.0 as Float, through: 2.0, by: 2.0) {
+            addBox(at: [x, deskH/2, southRowZ], w: deskW, h: deskH, d: deskD, color: deskColor)
+        }
+
+        // ── Chairs (5 — skip centre south-row chair for car spawn safety) ─
+        let chairH: Float = 0.95
+        let chairS: Float = 0.50   // square footprint
+        let northChairZ: Float = northRowZ + deskD/2 + 0.30 + chairS/2   // ~ -0.05
+        for x in stride(from: -2.0 as Float, through: 2.0, by: 2.0) {
+            addBox(at: [x, chairH/2, northChairZ], w: chairS, h: chairH, d: chairS, color: chairColor)
+        }
+        let southChairZ: Float = southRowZ + deskD/2 + 0.30 + chairS/2   // ~ 1.20
+        for x in [-2.0 as Float, 2.0] {  // skip x=0 — leave aisle for car
+            addBox(at: [x, chairH/2, southChairZ], w: chairS, h: chairH, d: chairS, color: chairColor)
+        }
+
+        // ── Clutter bins / boxes (5 scattered, avoiding everything above) ─
+        // Hand-picked clear positions:
+        let binPositions: [(SIMD3<Float>, Float, Float, Float)] = [
+            // (centre, w, h, d)
+            ([-2.6, 0.20, 0.0],  0.30, 0.40, 0.30),   // west aisle, between rows
+            ([ 2.6, 0.20, 0.0],  0.30, 0.40, 0.30),   // east aisle
+            ([-2.6, 0.20, -1.2], 0.30, 0.40, 0.30),   // west, between cabinet and desk row
+            ([ 2.6, 0.20, -1.2], 0.30, 0.40, 0.30),   // east, between cabinet and desk row
+            ([ 0.0, 0.15, -1.85], 0.40, 0.30, 0.40),  // small box pushed against north cabinets
+        ]
+        for (i, p) in binPositions.enumerated() {
+            addBox(at: p.0, w: p.1, h: p.2, d: p.3, color: binColors[i % binColors.count])
+        }
+    }
+
+    /// Add a box-shaped obstacle: registers visual entity AND AABB collision record.
+    private func addBox(at pos: SIMD3<Float>, w: Float, h: Float, d: Float, color: NSColor) {
+        let mesh = MeshResource.generateBox(width: w, height: h, depth: d)
+        let mat  = SimpleMaterial(color: color, isMetallic: false)
+        let ent  = ModelEntity(mesh: mesh, materials: [mat])
+        ent.position = pos
+        root.addChild(ent)
+        obstacles.append(Obstacle(pos: pos, halfX: w / 2, halfZ: d / 2, height: h))
+    }
+
+    private func addCar() {
+        // Tiny invisible proxy — FPV camera sits above, car body never visually rendered.
         let carMesh = MeshResource.generateSphere(radius: 0.001)
         car = ModelEntity(mesh: carMesh, materials: [SimpleMaterial(color: .clear, isMetallic: false)])
-        car.position    = [0, 0.5, 0]
+        // Spawn near south doorway (z = +1.8), facing -Z (into the room).
+        car.position    = [0, carBodyY, 1.8]
         car.orientation = simd_quatf(angle: 0, axis: [0, 1, 0])
+        yaw = 0
         root.addChild(car)
+    }
 
-        // Lights
+    private func addLights() {
         let key = DirectionalLight()
-        key.light.intensity = 8000
+        key.light.intensity = 6000
         key.orientation = simd_quatf(angle: -.pi / 4, axis: [1, 0, 0])
         root.addChild(key)
         let fill = DirectionalLight()
         fill.light.intensity = 2500
         fill.orientation = simd_quatf(angle: .pi / 5, axis: [-1, 0, 0])
         root.addChild(fill)
+    }
 
-        // FPV camera — at car position, oriented per car yaw via per-tick update
+    private func addCamera() {
         cam = PerspectiveCamera()
         cam.camera.fieldOfViewInDegrees = 75
-        cam.position = [0, 0.5 + eyeHeight, 0]
-        cam.look(at: [0, 0.5 + eyeHeight, -10], from: cam.position, relativeTo: nil)
+        cam.position = [0, carBodyY + eyeHeight, 1.8]
+        cam.look(at: [0, carBodyY + eyeHeight, -1], from: cam.position, relativeTo: nil)
         root.addChild(cam)
     }
+
+    // MARK: - Per-frame tick
 
     func startUpdates(keyboard: KeyboardMonitor,
                       hand: HandJoystick,
@@ -238,18 +265,15 @@ final class SimScene {
         let yawRate     = steerInput * maxSteerRate * speedFactor * (speed >= 0 ? 1 : -1)
         yaw += yawRate * dt
 
-        // Forward vector (car faces -Z at yaw=0)
         let fwdX =  sin(yaw)
         let fwdZ = -cos(yaw)
         let fwd  = SIMD3<Float>(fwdX, 0, fwdZ)
 
         // ── Move car ──
         var nextPos = car.position + fwd * speed * dt
-        nextPos.y = 0.5
+        nextPos.y = carBodyY
 
-        // AABB pillar collision
-        let carHalfX: Float = 0.5
-        let carHalfZ: Float = 0.5
+        // AABB collision
         for o in obstacles {
             let dx = nextPos.x - o.pos.x
             let dz = nextPos.z - o.pos.z
@@ -268,7 +292,7 @@ final class SimScene {
         car.position    = nextPos
         car.orientation = simd_quatf(angle: yaw, axis: [0, 1, 0])
 
-        // ── FPV camera — sit at car position + eye height, look along car forward ──
+        // ── FPV camera ──
         let eyePos = car.position + SIMD3<Float>(fwdX * eyeForward, eyeHeight, fwdZ * eyeForward)
         let lookTarget = eyePos + fwd * 10
         cam.position = eyePos
