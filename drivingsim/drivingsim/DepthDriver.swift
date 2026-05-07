@@ -268,17 +268,33 @@ final class DepthDriver: ObservableObject {
 
         // Decide command (decision tree with escape phase)
         let raw = decideCommand(zones: z)
+        // After decideCommand, escapePhase != 0 means this turn was triggered by the
+        // reverse-stuck escape manoeuvre — turn while reversing instead of forward.
+        let inEscape = (escapePhase != 0)
         let smoothed = push(raw)
         command = smoothed
         depthImage = preview
 
-        // Map command → keys
+        // Map command → keys.
+        // Sim has bike-model coupling: yaw rate scales with speed. Lone A/D at speed=0
+        // produces no rotation. Pair turns with throttle so the car can actually steer:
+        //   normal turn  → A/D + W   (turn while moving forward)
+        //   escape turn  → A/D + S   (turn while reversing — frees from corners)
         switch smoothed {
-        case .forward:   keys = [KeyboardMonitor.W]
-        case .turnLeft:  keys = [KeyboardMonitor.A]
-        case .reverse:   keys = [KeyboardMonitor.S]
-        case .turnRight: keys = [KeyboardMonitor.D]
-        case .brake:     keys = []
+        case .forward:
+            keys = [KeyboardMonitor.W]
+        case .reverse:
+            keys = [KeyboardMonitor.S]
+        case .turnLeft:
+            keys = inEscape
+                ? [KeyboardMonitor.A, KeyboardMonitor.S]
+                : [KeyboardMonitor.A, KeyboardMonitor.W]
+        case .turnRight:
+            keys = inEscape
+                ? [KeyboardMonitor.D, KeyboardMonitor.S]
+                : [KeyboardMonitor.D, KeyboardMonitor.W]
+        case .brake:
+            keys = []
         }
     }
 
