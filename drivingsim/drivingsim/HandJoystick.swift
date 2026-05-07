@@ -87,6 +87,14 @@ final class HandJoystick: NSObject, ObservableObject {
 
     private var emaLandmarks: [SIMD2<Float>]?      // 21 smoothed pixel landmarks
 
+    // ── timing stats (vision-queue writes, logged every statInterval frames) ──
+    nonisolated(unsafe) private var statFrames     = 0
+    nonisolated(unsafe) private var statDetected   = 0
+    nonisolated(unsafe) private var statSumInfer   = 0.0   // ms
+    nonisolated(unsafe) private var statMaxInfer   = 0.0   // ms
+    nonisolated(unsafe) private var statWindowT    = CACurrentMediaTime()
+    private let statInterval = 60
+
     func start() {
         AVCaptureDevice.requestAccess(for: .video) { [weak self] ok in
             guard ok else {
@@ -193,17 +201,25 @@ extension HandJoystick: AVCaptureVideoDataOutputSampleBufferDelegate {
         let width  = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
 
+        let tFrame = CACurrentMediaTime()
+
         let request = VNDetectHumanHandPoseRequest()
         request.maximumHandCount = 1
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
-        do { try handler.perform([request]) } catch {
-            return
-        }
+        let tInferStart = CACurrentMediaTime()
+        do { try handler.perform([request]) } catch { return }
+        let inferMs = (CACurrentMediaTime() - tInferStart) * 1000.0
+
+        statFrames  += 1
+        statSumInfer += inferMs
+        if inferMs > statMaxInfer { statMaxInfer = inferMs }
 
         guard let obs = request.results?.first as? VNHumanHandPoseObservation else {
+            logStatsIfNeeded()
             Task { @MainActor in self.handleNoHand() }
             return
         }
+        statDetected += 1
 
         // Vision joint name → MediaPipe-style index 0..20
         let order: [VNHumanHandPoseObservation.JointName] = [
@@ -235,7 +251,27 @@ extension HandJoystick: AVCaptureVideoDataOutputSampleBufferDelegate {
 
         let finalLms = lms
         let size = CGSize(width: width, height: height)
-        Task { @MainActor in self.processLandmarks(finalLms, size: size) }
+        let tFrameCopy = tFrame
+        logStatsIfNeeded()
+        Task { @MainActor in
+            let pipeMs = (CACurrentMediaTime() - tFrameCopy) * 1000.0
+            self.processLandmarks(finalLms, size: size, pipelineMs: pipeMs)
+        }
+    }
+
+    nonisolated private func logStatsIfNeeded() {
+        guard statFrames >= statInterval else { return }
+        let elapsed = CACurrentMediaTime() - statWindowT
+        let fps     = Double(statFrames) / elapsed
+        let detRate = Double(statDetected) / Double(statFrames) * 100.0
+        let avgInfer = statSumInfer / Double(max(1, statDetected > 0 ? statDetected : statFrames))
+        print(String(format: "[HandJoystick] %.0f fps | detection %.0f%% | Vision infer avg %.1f ms  max %.1f ms",
+                     fps, detRate, avgInfer, statMaxInfer))
+        statFrames   = 0
+        statDetected = 0
+        statSumInfer = 0
+        statMaxInfer = 0
+        statWindowT  = CACurrentMediaTime()
     }
 
     @MainActor
@@ -246,8 +282,21 @@ extension HandJoystick: AVCaptureVideoDataOutputSampleBufferDelegate {
         if !landmarks.isEmpty { landmarks = [] }
     }
 
+    // MainActor-side pipeline stats
+    private var pipeCount  = 0
+    private var pipeSumMs  = 0.0
+    private var pipeMaxMs  = 0.0
+
     @MainActor
-    private func processLandmarks(_ raw: [SIMD2<Float>], size: CGSize) {
+    private func processLandmarks(_ raw: [SIMD2<Float>], size: CGSize, pipelineMs: Double = 0) {
+        pipeCount  += 1
+        pipeSumMs  += pipelineMs
+        if pipelineMs > pipeMaxMs { pipeMaxMs = pipelineMs }
+        if pipeCount >= 60 {
+            print(String(format: "[HandJoystick] pipeline (frame→publish) avg %.1f ms  max %.1f ms",
+                         pipeSumMs / Double(pipeCount), pipeMaxMs))
+            pipeCount = 0; pipeSumMs = 0; pipeMaxMs = 0
+        }
         // EMA on landmark positions for joystick decision (matches Python smoothing).
         let smoothed: [SIMD2<Float>]
         if let prev = emaLandmarks, prev.count == raw.count {
