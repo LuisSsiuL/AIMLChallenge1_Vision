@@ -34,8 +34,21 @@ final class SimScene {
     private var yaw:   Float = 0
 
     // Procedural obstacles — single source of truth for render + collision
-    private struct Obstacle { let pos: SIMD3<Float>; let halfX: Float; let halfZ: Float }
+    private struct Obstacle { let pos: SIMD3<Float>; let halfX: Float; let halfZ: Float; let height: Float }
     private var obstacles: [Obstacle] = []
+
+    /// Public read-only snapshot for SimFPVRenderer mirror scene.
+    var obstacleSnapshot: [(pos: SIMD3<Float>, halfX: Float, halfZ: Float, height: Float)] {
+        obstacles.map { ($0.pos, $0.halfX, $0.halfZ, $0.height) }
+    }
+
+    /// Eye height — exposed so SimFPVRenderer matches the on-screen FPV camera.
+    var eyeHeightPublic: Float { eyeHeight }
+
+    /// Current car position (world). For SimFPVRenderer per-frame camera sync.
+    var carWorldPosition: SIMD3<Float> { car?.position ?? .zero }
+    /// Current car yaw (radians).
+    var carYaw: Float { yaw }
 
     private var timer: Timer?
 
@@ -140,7 +153,7 @@ final class SimScene {
             ent.orientation = simd_quatf(angle: rot, axis: [0, 1, 0])
             root.addChild(ent)
 
-            obstacles.append(Obstacle(pos: pos, halfX: collHalfX, halfZ: collHalfZ))
+            obstacles.append(Obstacle(pos: pos, halfX: collHalfX, halfZ: collHalfZ, height: h))
         }
 
         // Car — tiny invisible mesh (FPV: not rendered visibly)
@@ -168,11 +181,17 @@ final class SimScene {
         root.addChild(cam)
     }
 
-    func startUpdates(keyboard: KeyboardMonitor, hand: HandJoystick) {
+    func startUpdates(keyboard: KeyboardMonitor,
+                      hand: HandJoystick,
+                      depth: DepthDriver,
+                      modeProvider: @escaping @MainActor () -> DrivingMode) {
         guard timer == nil else { return }
         let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             guard let self else { return }
-            Task { @MainActor in self.tick(kb: keyboard, hand: hand, dt: 1.0 / 60.0) }
+            Task { @MainActor in
+                let m = modeProvider()
+                self.tick(kb: keyboard, hand: hand, depth: depth, mode: m, dt: 1.0 / 60.0)
+            }
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
@@ -183,12 +202,25 @@ final class SimScene {
         timer = nil
     }
 
-    private func tick(kb: KeyboardMonitor, hand: HandJoystick, dt: Float) {
-        // OR keyboard + hand inputs
-        let inForward  = kb.forward  || hand.forward
-        let inBackward = kb.backward || hand.backward
-        let inLeft     = kb.left     || hand.left
-        let inRight    = kb.right    || hand.right
+    private func tick(kb: KeyboardMonitor,
+                      hand: HandJoystick,
+                      depth: DepthDriver,
+                      mode: DrivingMode,
+                      dt: Float) {
+        // Input gating per mode:
+        //   .off       — kb only
+        //   .hand      — kb + hand
+        //   .assisted  — depth → W/S; (kb||hand) → A/D
+        //   .automated — depth → all four; kb/hand ignored
+        let kbActive   = (mode != .automated)
+        let handActive = (mode == .hand || mode == .assisted)
+        let depthWS    = (mode == .assisted || mode == .automated)
+        let depthAD    = (mode == .automated)
+
+        let inForward  = (kbActive && kb.forward)  || (handActive && hand.forward)  || (depthWS && depth.forward)
+        let inBackward = (kbActive && kb.backward) || (handActive && hand.backward) || (depthWS && depth.backward)
+        let inLeft     = (kbActive && kb.left)     || (handActive && hand.left)     || (depthAD && depth.left)
+        let inRight    = (kbActive && kb.right)    || (handActive && hand.right)    || (depthAD && depth.right)
 
         // ── Throttle / brake ──
         if inForward {

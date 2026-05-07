@@ -80,13 +80,38 @@ RealityKit FPV sim used to develop and test gesture control before deploying to 
 
 ```
 drivingsim/drivingsim/
-├── SimScene.swift          # FPV scene: 120 procedural rubble obstacles, AABB collision
-├── ContentView.swift       # SwiftUI root: keyboard + hand toggle, webcam overlay, key-cap HUD
-├── HandJoystick.swift      # Native Swift gesture driver (see below)
+├── SimScene.swift          # FPV scene: 120 procedural rubble obstacles, AABB collision; tick() gates inputs by mode
+├── ContentView.swift       # SwiftUI root: mode picker (Off/Hand/Assisted/Auto), hand + depth previews, key-cap HUD
+├── DrivingMode.swift       # enum Off/Hand/Assisted/Auto + needsHand/needsDepth helpers
+├── HandJoystick.swift      # Native Vision hand gesture driver (see below)
+├── DepthDriver.swift       # CoreML depth → 5-zone scoring → WASD (port of live_depth_wasd.py)
+├── SimFPVRenderer.swift    # RealityRenderer offscreen FPV camera → CVPixelBuffer (parallel scene)
+├── DepthPreview.swift      # SwiftUI depth+zone overlay (top-right when Assisted/Auto)
 ├── CameraPreview.swift     # NSViewRepresentable wrapping AVCaptureVideoPreviewLayer
 ├── KeyboardMonitor.swift   # NSEvent WASD monitor; returns nil to consume (no key-repeat beep)
+├── DepthAnythingV2SmallF16.mlpackage  # Apple CoreML depth model (518×518, F16, ~47MB)
 └── drivingsim.entitlements # sandbox + camera permission
 ```
+
+### Driving modes
+
+- **Off** — keyboard only (regression baseline)
+- **Hand** — keyboard + hand both contribute all four axes
+- **Assisted** — depth → W/S only; (kb || hand) → A/D. Operator steers, depth handles collision avoidance
+- **Auto** — depth → all four; kb/hand ignored. Self-driving mode
+
+`SimScene.tick(kb:hand:depth:mode:dt:)` ORs the active sources per mode. `ContentView` starts/stops `HandJoystick`, `SimFPVRenderer`, and `DepthDriver` on mode change.
+
+### DepthDriver.swift — CoreML perception
+
+**Pipeline:** `CVPixelBuffer (518×518)` → `MLModel.prediction` → grayscale depth → percentile-clip + EMA bounds → invert (close=high, far=low) → 5-zone obstacle scores (FarLeft/Left/Center/Right/FarRight) → decision tree (escape > reverse > forward > steer-best) → 5-frame majority-vote smoother → WASD `Set<UInt16>`.
+
+Direct CoreML (not VNCoreMLRequest) — depth is dense pixel regression, Vision is for classification/detection.
+
+**Frame source:** `SimFPVRenderer` renders the sim from the car's eye position to a CVPixelBuffer each tick using `RealityRenderer` with a parallel scene (mirrors obstacles + sync car position). Same architecture works unchanged when ESP32-CAM streams from the real RC car later — just swap the frame source.
+
+**Timing logging** every 30 frames:
+- `[DepthDriver] XX fps | infer avg X.X ms  max X.X ms`
 
 ### HandJoystick.swift — native Vision gesture driver
 

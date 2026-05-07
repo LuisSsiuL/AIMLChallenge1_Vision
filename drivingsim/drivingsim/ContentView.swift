@@ -26,8 +26,6 @@ private struct LandmarkOverlay: View {
             Canvas { ctx, _ in
                 guard landmarks.count == 21,
                       frameSize.width > 0, frameSize.height > 0 else { return }
-                // Replicate AVLayerVideoGravity.resizeAspect (letterbox) so this
-                // overlay lives in the exact same rect as the displayed video.
                 let viewW  = geo.size.width
                 let viewH  = geo.size.height
                 let frameW = frameSize.width
@@ -43,7 +41,6 @@ private struct LandmarkOverlay: View {
                             y: CGFloat(landmarks[i].y) * scale + offY)
                 }
 
-                // edges
                 var path = Path()
                 for (a, b) in HAND_EDGES {
                     path.move(to: pt(a))
@@ -53,10 +50,9 @@ private struct LandmarkOverlay: View {
                            with: .color(active ? .green : .white.opacity(0.7)),
                            lineWidth: 2)
 
-                // joints
                 for i in 0..<21 {
                     let p = pt(i)
-                    let r: CGFloat = (i == 8 || i == 5) ? 4.5 : 3   // highlight index MCP/tip
+                    let r: CGFloat = (i == 8 || i == 5) ? 4.5 : 3
                     let rect = CGRect(x: p.x - r, y: p.y - r, width: r*2, height: r*2)
                     ctx.fill(Path(ellipseIn: rect),
                              with: .color(i == 8 ? .yellow : .cyan))
@@ -84,31 +80,46 @@ private struct KeyCapView: View {
 struct ContentView: View {
     @StateObject private var keyboard = KeyboardMonitor()
     @StateObject private var hand     = HandJoystick()
-    @State private var handEnabled    = false
+    @StateObject private var depth    = DepthDriver()
+    @State private var mode: DrivingMode = .off
     @State private var scene = SimScene.make()
+    @State private var fpv: SimFPVRenderer?
+    @State private var fpvTimer: Timer?
 
     var body: some View {
         RealityView { content in
             content.add(scene.root)
-            scene.startUpdates(keyboard: keyboard, hand: hand)
+            scene.startUpdates(
+                keyboard: keyboard,
+                hand: hand,
+                depth: depth,
+                modeProvider: { mode }
+            )
         } update: { _ in }
         .frame(minWidth: 900, minHeight: 600)
-        .onAppear { keyboard.start() }
-        .onDisappear {
-            keyboard.stop()
-            hand.stop()
-            scene.stopUpdates()
+        .onAppear {
+            keyboard.start()
+            // FPV renderer reads the obstacles laid down by SimScene.setup()
+            fpv = SimFPVRenderer(obstacles: scene.obstacleSnapshot,
+                                 eyeHeight: scene.eyeHeightPublic,
+                                 width: depth.inputSize.width,
+                                 height: depth.inputSize.height)
         }
+        .onDisappear {
+            stopAll()
+        }
+        .onChange(of: mode) { _, newMode in updateMode(newMode) }
         .overlay(alignment: .bottomLeading) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("W/S accel-brake   A/D steer")
                     .font(.caption)
-                Toggle("Hand Control", isOn: $handEnabled)
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                    .onChange(of: handEnabled) { _, on in
-                        if on { hand.start() } else { hand.stop() }
+                Picker("Mode", selection: $mode) {
+                    ForEach(DrivingMode.allCases) { m in
+                        Text(m.label).tag(m)
                     }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 280)
             }
             .foregroundColor(.white)
             .padding(8)
@@ -117,43 +128,118 @@ struct ContentView: View {
             .padding(12)
         }
         .overlay(alignment: .topTrailing) {
-            if handEnabled {
-                VStack(spacing: 4) {
-                    ZStack {
-                        CameraPreview(session: hand.captureSession)
-                        LandmarkOverlay(landmarks: hand.landmarks,
-                                        frameSize: hand.frameSize,
-                                        active: hand.lastActive)
+            VStack(alignment: .trailing, spacing: 8) {
+                if mode.needsHand {
+                    VStack(spacing: 4) {
+                        ZStack {
+                            CameraPreview(session: hand.captureSession)
+                            LandmarkOverlay(landmarks: hand.landmarks,
+                                            frameSize: hand.frameSize,
+                                            active: hand.lastActive)
+                        }
+                        .frame(width: 240, height: 180)
+                        .cornerRadius(8)
+                        .overlay(RoundedRectangle(cornerRadius: 8)
+                            .stroke(hand.lastActive ? Color.green : Color.white.opacity(0.4),
+                                    lineWidth: 2))
+                        Text("Hand")
+                            .font(.caption2)
+                            .foregroundColor(.white.opacity(0.7))
                     }
-                    .frame(width: 240, height: 180)
-                    .cornerRadius(8)
-                    .overlay(RoundedRectangle(cornerRadius: 8)
-                        .stroke(hand.lastActive ? Color.green : Color.white.opacity(0.4),
-                                lineWidth: 2))
-                    Text("Webcam")
-                        .font(.caption2)
-                        .foregroundColor(.white.opacity(0.7))
                 }
-                .padding(12)
-            }
-        }
-        .overlay(alignment: .bottomTrailing) {
-            VStack(spacing: 4) {
-                HStack {
-                    KeyCapView(label: "W", pressed: keyboard.forward  || hand.forward)
-                }
-                HStack(spacing: 4) {
-                    KeyCapView(label: "A", pressed: keyboard.left     || hand.left)
-                    KeyCapView(label: "S", pressed: keyboard.backward || hand.backward)
-                    KeyCapView(label: "D", pressed: keyboard.right    || hand.right)
-                }
-                if handEnabled {
-                    Text(hand.lastActive ? "active" : "deadzone")
-                        .font(.caption2)
-                        .foregroundColor(hand.lastActive ? .green : .gray)
+                if mode.needsDepth {
+                    VStack(spacing: 4) {
+                        DepthPreview(driver: depth)
+                            .frame(width: 240, height: 240)
+                            .cornerRadius(8)
+                            .overlay(RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.cyan.opacity(0.5), lineWidth: 2))
+                        Text("Depth (\(mode.label))")
+                            .font(.caption2)
+                            .foregroundColor(.white.opacity(0.7))
+                    }
                 }
             }
             .padding(12)
         }
+        .overlay(alignment: .bottomTrailing) {
+            VStack(spacing: 4) {
+                HStack {
+                    KeyCapView(label: "W", pressed: anyForward)
+                }
+                HStack(spacing: 4) {
+                    KeyCapView(label: "A", pressed: anyLeft)
+                    KeyCapView(label: "S", pressed: anyBackward)
+                    KeyCapView(label: "D", pressed: anyRight)
+                }
+            }
+            .padding(12)
+        }
+    }
+
+    private var anyForward:  Bool {
+        keyboard.forward
+        || (mode.needsHand  && hand.forward)
+        || (mode.needsDepth && depth.forward)
+    }
+    private var anyBackward: Bool {
+        keyboard.backward
+        || (mode.needsHand  && hand.backward)
+        || (mode.needsDepth && depth.backward)
+    }
+    private var anyLeft:     Bool {
+        keyboard.left
+        || (mode.needsHand  && hand.left)
+        || (mode == .automated && depth.left)
+    }
+    private var anyRight:    Bool {
+        keyboard.right
+        || (mode.needsHand  && hand.right)
+        || (mode == .automated && depth.right)
+    }
+
+    private func updateMode(_ newMode: DrivingMode) {
+        if newMode.needsHand {
+            hand.start()
+        } else {
+            hand.stop()
+        }
+        if newMode.needsDepth {
+            depth.start()
+            startFPVTimer()
+        } else {
+            depth.stop()
+            stopFPVTimer()
+        }
+    }
+
+    private func startFPVTimer() {
+        guard fpvTimer == nil, fpv != nil else { return }
+        let t = Timer(timeInterval: 1.0 / 30.0, repeats: true) { _ in
+            Task { @MainActor in
+                guard let renderer = fpv else { return }
+                let pos = scene.carWorldPosition
+                let yaw = scene.carYaw
+                if let buf = renderer.render(carPosition: pos, yaw: yaw,
+                                              eyeHeight: scene.eyeHeightPublic) {
+                    depth.submit(buf)
+                }
+            }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        fpvTimer = t
+    }
+
+    private func stopFPVTimer() {
+        fpvTimer?.invalidate()
+        fpvTimer = nil
+    }
+
+    private func stopAll() {
+        keyboard.stop()
+        hand.stop()
+        depth.stop()
+        scene.stopUpdates()
+        stopFPVTimer()
     }
 }
