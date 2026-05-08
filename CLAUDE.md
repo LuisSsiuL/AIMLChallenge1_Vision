@@ -117,12 +117,14 @@ Direct CoreML (not VNCoreMLRequest) — depth is dense pixel regression, Vision 
 
 Ports `controls/gesture_index_joystick.py` to Swift with no Python dependency.
 
-**Pipeline:** `AVCaptureSession (640×480 BGRA)` → `VNDetectHumanHandPoseRequest` → 21 landmarks → EMA smooth → MCP→tip vector → WASD `Set<UInt16>`
+**Pipeline:** `AVCaptureSession (640×480 BGRA)` → `VNDetectHumanHandPoseRequest` → 21 landmarks → One Euro Filter smooth → MCP→tip vector → WASD `Set<UInt16>`
 
 **Key design:**
 - Vision joint order mapped to MediaPipe indices (wrist=0, indexMCP=5, indexTip=8, etc.)
 - Vision coords: x∈[0,1] right, y∈[0,1] bottom-up → flip both to match Python image convention
-- EMA internal for joystick decisions; raw landmarks published for overlay (no lag on visual)
+- One Euro Filter (Casiez 2012) per axis, per landmark — 21×2 = 42 scalar filters. Adaptive cutoff `cutoff = min_cutoff + beta·|velocity|`; jitter-free at rest, low lag (~5–8ms) on fast motion. Replaced fixed-α EMA. Used internally for joystick decisions; raw landmarks published for overlay (no lag on visual).
+- Velocity-based prediction during dropouts: filter's smoothed velocity (`dxPrev`) extrapolates landmarks (`predicted = lastValue + velocity·dt`) when Vision misses a hand. `computeKeys` runs on predicted positions so WASD stays live up to `hold_frames`. Past cap → clear keys + `resetFilters()` for clean re-detection. dt accumulates across missed frames so the next real frame closes the gap in one filter step (no drift artifacts).
+- Config: `oef_min_cutoff=1.0, beta=0.05, dcutoff=1.0` in `controls/joystick_config.json` (Casiez defaults). Python side (`gesture_index_joystick.py`) still uses EMA via `ema_alpha`; Swift JSONDecoder ignores it.
 - `nonisolated(unsafe)` on `session`/`videoOutput`; `@preconcurrency import AVFoundation` for Swift 6
 - Same surface as `KeyboardMonitor`: `.forward/.backward/.left/.right` bools, OR'd in `SimScene.tick`
 
@@ -142,7 +144,6 @@ Ports `controls/gesture_index_joystick.py` to Swift with no Python dependency.
 
 - **Open palm stop gesture** — all 5 tips extended → override keys to empty (emergency stop)
 - **Analog output** — expose `lastVec` magnitude to SimScene for proportional speed/steer
-- **Temporal hold** — keep last key state N frames after hand loss (prevent stutter)
 - **WiFi TX** — UDP socket sending command packets to ESP32 on car
 - **Onboard human detector** — YOLOv8-nano or MobileNet-SSD running on Raspberry Pi / Jetson Nano
 - **Car firmware** — ESP32 motor PWM control receiving WiFi commands

@@ -107,7 +107,8 @@ final class SimFPVRenderer {
 
         // FPV camera.
         let cam = PerspectiveCamera()
-        cam.camera.fieldOfViewInDegrees = 75
+        // ESP32-CAM (OV2640 stock lens) ≈ 65° horizontal FOV.
+        cam.camera.fieldOfViewInDegrees = 65
         cam.position = [0, 0.5 + eyeHeight, 0]
         cam.look(at: [0, 0.5 + eyeHeight, -10], from: cam.position, relativeTo: nil)
         renderer.entities.append(cam)

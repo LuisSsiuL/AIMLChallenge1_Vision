@@ -2,7 +2,8 @@
 //  DepthPreview.swift
 //  drivingsim
 //
-//  Top-right preview of the colourised depth map + 5-zone overlay + command label.
+//  Top-right preview of the colourised depth map + 7×7 zone overlay + command label.
+//  FAR row (top 40% of ROI) = F1–F7. NEAR row (bottom 60% of ROI) = N1–N7.
 //
 
 import SwiftUI
@@ -26,30 +27,55 @@ struct DepthPreview: View {
                 )
             }
 
-            // Zone overlay
+            // Zone overlay — FAR row (top 40% of ROI) + NEAR row (bottom 60%)
             GeometryReader { geo in
-                let w = geo.size.width
-                let h = geo.size.height
-                let row0 = h * 0.30   // navRowStart
+                let w      = geo.size.width
+                let h      = geo.size.height
+                let row0   = h * 0.0             // navRowStart — no sky skip indoors
+                let roiH   = h - row0
+                let farEnd = row0 + roiH * 0.40  // far/near split
+
+                let count = CGFloat(7)
                 ZStack {
-                    ForEach(Array(driver.zones.enumerated()), id: \.offset) { i, z in
-                        let x0 = w * CGFloat(i) / 5.0
-                        let x1 = w * CGFloat(i + 1) / 5.0
+                    // FAR zones F1–F7
+                    ForEach(Array(driver.farZones.enumerated()), id: \.offset) { i, z in
+                        let x0  = w * CGFloat(i)     / count
+                        let x1  = w * CGFloat(i + 1) / count
+                        let bh  = farEnd - row0
+                        let cy  = row0 + bh / 2
                         Rectangle()
                             .fill(zoneColor(z.state).opacity(0.28))
-                            .frame(width: x1 - x0, height: h - row0)
-                            .position(x: (x0 + x1) / 2, y: row0 + (h - row0) / 2)
-                            .overlay(
-                                Rectangle()
-                                    .stroke(Color.white.opacity(0.6), lineWidth: 0.5)
-                                    .frame(width: x1 - x0, height: h - row0)
-                                    .position(x: (x0 + x1) / 2, y: row0 + (h - row0) / 2)
-                            )
+                            .frame(width: x1 - x0, height: bh)
+                            .position(x: (x0 + x1) / 2, y: cy)
+                        Rectangle()
+                            .stroke(Color.white.opacity(0.5), lineWidth: 0.5)
+                            .frame(width: x1 - x0, height: bh)
+                            .position(x: (x0 + x1) / 2, y: cy)
                         Text("\(Int(z.obstacleScore))")
-                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .font(.system(size: 8, weight: .bold, design: .monospaced))
                             .foregroundColor(.white)
                             .shadow(color: .black, radius: 1)
-                            .position(x: (x0 + x1) / 2, y: row0 + (h - row0) / 2)
+                            .position(x: (x0 + x1) / 2, y: cy)
+                    }
+                    // NEAR zones N1–N7
+                    ForEach(Array(driver.nearZones.enumerated()), id: \.offset) { i, z in
+                        let x0  = w * CGFloat(i)     / count
+                        let x1  = w * CGFloat(i + 1) / count
+                        let bh  = h - farEnd
+                        let cy  = farEnd + bh / 2
+                        Rectangle()
+                            .fill(zoneColor(z.state).opacity(0.28))
+                            .frame(width: x1 - x0, height: bh)
+                            .position(x: (x0 + x1) / 2, y: cy)
+                        Rectangle()
+                            .stroke(Color.white.opacity(0.5), lineWidth: 0.5)
+                            .frame(width: x1 - x0, height: bh)
+                            .position(x: (x0 + x1) / 2, y: cy)
+                        Text("\(Int(z.obstacleScore))")
+                            .font(.system(size: 8, weight: .bold, design: .monospaced))
+                            .foregroundColor(.white)
+                            .shadow(color: .black, radius: 1)
+                            .position(x: (x0 + x1) / 2, y: cy)
                     }
                 }
             }

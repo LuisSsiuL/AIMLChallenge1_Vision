@@ -75,14 +75,15 @@ final class SimScene {
         // Outdoor ground (visible through doorway). Matte diffuse — receives shadows.
         let groundSize: Float = 200
         let groundMesh = MeshResource.generateBox(width: groundSize, height: 0.02, depth: groundSize)
-        let groundMat  = SimpleMaterial(color: NSColor(red: 0.30, green: 0.42, blue: 0.30, alpha: 1),
+        // Bright ground — high-contrast environment so dark objects pop.
+        let groundMat  = SimpleMaterial(color: NSColor(white: 0.92, alpha: 1),
                                          roughness: 1.0, isMetallic: false)
         let ground     = ModelEntity(mesh: groundMesh, materials: [groundMat])
         ground.position = [0, -0.011, 0]
         root.addChild(ground)
 
-        // Office floor — matte wood-tone, receives furniture shadows.
-        let floorMat = SimpleMaterial(color: NSColor(red: 0.55, green: 0.42, blue: 0.30, alpha: 1),
+        // Office floor — bright off-white, receives furniture shadows.
+        let floorMat = SimpleMaterial(color: NSColor(white: 0.95, alpha: 1),
                                        roughness: 1.0, isMetallic: false)
         let floorMesh = MeshResource.generateBox(width: 30.0, height: 0.005, depth: 20.0)
         let floor = ModelEntity(mesh: floorMesh, materials: [floorMat])
@@ -100,16 +101,17 @@ final class SimScene {
         let halfW = roomW / 2
         let halfD = roomD / 2
 
-        let wallColor    = NSColor(red: 0.78, green: 0.80, blue: 0.82, alpha: 1)
-        let cabinetColor = NSColor(white: 0.72, alpha: 1)
-        let deskColor    = NSColor(red: 0.42, green: 0.28, blue: 0.18, alpha: 1)
-        let chairColor   = NSColor(white: 0.20, alpha: 1)
+        // High-contrast scheme: bright walls, dark obstacles.
+        let wallColor    = NSColor(white: 0.95, alpha: 1)   // near-white background
+        let cabinetColor = NSColor(white: 0.12, alpha: 1)   // dark
+        let deskColor    = NSColor(white: 0.10, alpha: 1)   // dark
+        let chairColor   = NSColor(white: 0.08, alpha: 1)   // very dark
         let binColors: [NSColor] = [
-            NSColor(red: 0.75, green: 0.30, blue: 0.30, alpha: 1),  // muted red
-            NSColor(red: 0.30, green: 0.45, blue: 0.70, alpha: 1),  // muted blue
-            NSColor(red: 0.80, green: 0.60, blue: 0.25, alpha: 1),  // muted orange
-            NSColor(red: 0.30, green: 0.65, blue: 0.55, alpha: 1),  // muted teal
-            NSColor(red: 0.55, green: 0.50, blue: 0.30, alpha: 1),  // muted olive
+            NSColor(white: 0.10, alpha: 1),
+            NSColor(white: 0.15, alpha: 1),
+            NSColor(white: 0.12, alpha: 1),
+            NSColor(white: 0.08, alpha: 1),
+            NSColor(white: 0.18, alpha: 1),
         ]
 
         // ── Walls ─────────────────────────────────────────────────────────
@@ -173,13 +175,14 @@ final class SimScene {
         }
 
         // ── Extra furniture / structural obstacles ────────────────────────
-        let sofaColor       = NSColor(red: 0.30, green: 0.32, blue: 0.40, alpha: 1)  // dark blue-grey
-        let pillarColor     = NSColor(white: 0.65, alpha: 1)                          // light grey
-        let plantColor      = NSColor(red: 0.18, green: 0.45, blue: 0.22, alpha: 1)  // dark green
-        let cardboardColor  = NSColor(red: 0.62, green: 0.45, blue: 0.28, alpha: 1)  // cardboard brown
-        let printerColor    = NSColor(white: 0.30, alpha: 1)                          // dark grey
-        let coolerColor     = NSColor(red: 0.55, green: 0.75, blue: 0.85, alpha: 1)  // light blue
-        let whiteboardColor = NSColor(white: 0.95, alpha: 1)                          // white
+        // All physical obstacles → dark. Whiteboard is a wall fixture, stays bright.
+        let sofaColor       = NSColor(white: 0.12, alpha: 1)
+        let pillarColor     = NSColor(white: 0.10, alpha: 1)
+        let plantColor      = NSColor(white: 0.14, alpha: 1)
+        let cardboardColor  = NSColor(white: 0.18, alpha: 1)
+        let printerColor    = NSColor(white: 0.08, alpha: 1)
+        let coolerColor     = NSColor(white: 0.16, alpha: 1)
+        let whiteboardColor = NSColor(white: 0.97, alpha: 1)   // wall fixture, bright
 
         // Long couches / benches against side walls (give the room more "stuff")
         addBox(at: [-14.5, 0.40,  6.0], w: 0.6, h: 0.8, d: 2.5, color: sofaColor)   // west wall, south
