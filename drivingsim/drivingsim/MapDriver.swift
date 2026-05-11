@@ -47,19 +47,20 @@ final class MapDriver: ObservableObject {
     private var frontierCells: [Cell] = []
     private var personCells:   [Cell] = []   // last known person positions on map
 
-    // Replanning cadence — don't replan every frame (expensive A*).
-    private let replanIntervalFrames: Int = 15
+    // Replanning cadence — don't replan every frame (A* is O(N²) worst-case).
+    private let replanIntervalFrames: Int = 6     // ~0.2s @ 30Hz inference
     private var framesSinceReplan:    Int = 0
 
     // Map visualization cadence.
-    private let mapRenderInterval: Int = 10
+    private let mapRenderInterval: Int = 5
     private var framesSinceMapRender: Int = 0
 
-    // Goal-reached threshold in cells.
-    private let goalReachedCells: Int = 5
-
     // Inflation radius for A* (robot half-width / resolution = ~1 cell).
-    private let inflationRadius: Int = 2
+    private let inflationRadius: Int = 1
+
+    // Frames between diagnostic prints.
+    private let logEveryFrames: Int = 30
+    private var framesSinceLog:  Int = 0
 
     // YOLO seek override — when set, A* targets this world position instead of frontier.
     private(set) var seekTarget: SIMD2<Float>? = nil
@@ -250,25 +251,31 @@ final class MapDriver: ObservableObject {
             replan(pose: pose)
         }
 
-        // 3. Follow current path.
+        // 3. Follow current path (or fallback exploration).
         let inflated = grid.inflated(by: inflationRadius)
-        let cmd = WaypointFollower.nextCommand(
-            posePos: pose.pos,
-            poseYaw: pose.yaw,
-            path: &currentPath,
-            grid: inflated
-        )
+        let cmd: DrivingCommand
+        if currentPath.isEmpty {
+            // No path → fallback. Look ahead in current heading.
+            cmd = fallbackExplore(pose: pose, grid: inflated)
+        } else {
+            cmd = WaypointFollower.nextCommand(
+                posePos: pose.pos,
+                poseYaw: pose.yaw,
+                path:    &currentPath,
+                grid:    inflated
+            )
+        }
 
-        // 4. Update pose estimator with commands we just decided.
-        // (Next tick it integrates these keys.)
-        poseEstimator.tickFromCommand(keys: keysFor(cmd), dt: 1.0 / 30.0)
-
-        // 5. Publish.
+        // 4. Publish keys + command FIRST so SimScene picks them up.
         command = cmd
         keys    = keysFor(cmd)
         depthImage = preview
 
-        // 6. Render map overlay at lower cadence (CGImage creation is expensive).
+        // 5. Update pose estimator with the SAME keys SimScene will read.
+        // Use 1/30 dt — matches FPV+inference loop cadence.
+        poseEstimator.tickFromCommand(keys: keys, dt: 1.0 / 30.0)
+
+        // 6. Render map overlay at lower cadence (CGImage build is expensive).
         framesSinceMapRender += 1
         if framesSinceMapRender >= mapRenderInterval {
             framesSinceMapRender = 0
@@ -280,6 +287,29 @@ final class MapDriver: ObservableObject {
                 personCells:   personCells
             )
         }
+
+        // 7. Periodic diagnostics.
+        framesSinceLog += 1
+        if framesSinceLog >= logEveryFrames {
+            framesSinceLog = 0
+            let robotCell = OccupancyGrid.worldToCell(pose.pos)
+            print(String(format: "[MapDriver] pose=(%.2f,%.2f,y=%.2f) cell=(%d,%d) frontiers=%d path=%d cmd=%@",
+                         pose.pos.x, pose.pos.y, pose.yaw,
+                         robotCell.col, robotCell.row,
+                         frontierCells.count, currentPath.count, cmd.rawValue))
+        }
+    }
+
+    /// Fallback when A* gives no path: drive forward if direct lookahead is clear,
+    /// otherwise turn in place. Ensures robot keeps mapping rather than freezing.
+    @MainActor
+    private func fallbackExplore(pose: (pos: SIMD2<Float>, yaw: Float),
+                                 grid: OccupancyGrid) -> DrivingCommand {
+        let stepM = OccupancyGrid.resolution * 4   // 0.4m lookahead
+        let fwdPos = pose.pos + SIMD2<Float>(sin(pose.yaw), -cos(pose.yaw)) * stepM
+        let fwdCell = OccupancyGrid.worldToCell(fwdPos)
+        if grid.state(fwdCell) == .occupied { return .forwardRight }
+        return .forward
     }
 
     // MARK: - Replanning
@@ -289,41 +319,35 @@ final class MapDriver: ObservableObject {
         let poseCell = OccupancyGrid.worldToCell(pose.pos)
 
         // Determine goal.
-        let goalCell: Cell
+        let goalCell: Cell?
         if let seek = seekTarget {
             goalCell = OccupancyGrid.worldToCell(seek)
         } else {
-            // Frontier exploration.
+            // Frontier exploration. Compute frontiers + clusters.
             let frontiers = FrontierExplorer.findFrontiers(in: grid)
             frontierCells = frontiers
             let clusters  = FrontierExplorer.cluster(frontiers: frontiers)
-            guard let goal = FrontierExplorer.pickGoal(clusters: clusters, from: poseCell) else {
-                // No frontiers — fully explored or map needs more coverage.
-                command = .brake; keys = []
-                print("[MapDriver] no frontiers remaining — exploration complete")
-                return
-            }
-            goalCell = goal
+            goalCell = FrontierExplorer.pickGoal(clusters: clusters, from: poseCell)
         }
 
-        // Check goal changed or path depleted.
-        let goalChanged = currentGoal != goalCell
+        guard let goal = goalCell else {
+            // No goal — keep last path or empty (fallbackExplore will drive).
+            currentGoal = nil
+            return
+        }
+
+        // Always replan if goal changed; else keep existing path until depleted.
+        let goalChanged = currentGoal != goal
         let pathDepleted = currentPath.count <= 1
-        guard goalChanged || pathDepleted else { return }
+        if !goalChanged && !pathDepleted { return }
 
-        currentGoal = goalCell
+        currentGoal = goal
 
-        // A* on inflated grid.
+        // Try A* on inflated grid first (safer path), then non-inflated as fallback.
         let inflated = grid.inflated(by: inflationRadius)
-        currentPath  = inflated.aStar(from: poseCell, to: goalCell)
-
+        currentPath  = inflated.aStar(from: poseCell, to: goal)
         if currentPath.isEmpty {
-            // No path found — try without inflation (narrow doorways).
-            currentPath = grid.aStar(from: poseCell, to: goalCell)
-        }
-
-        if currentPath.isEmpty {
-            print("[MapDriver] A* found no path to \(goalCell) — will retry next replan")
+            currentPath = grid.aStar(from: poseCell, to: goal)
         }
     }
 

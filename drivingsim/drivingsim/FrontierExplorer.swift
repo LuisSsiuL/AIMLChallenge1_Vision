@@ -21,7 +21,7 @@ enum FrontierExplorer {
 
     // Minimum cluster size to be considered a valid exploration target.
     // Small isolated frontier cells are likely noise from depth map edges.
-    static let minClusterSize: Int = 3
+    static let minClusterSize: Int = 2
 
     // MARK: - Main API
 

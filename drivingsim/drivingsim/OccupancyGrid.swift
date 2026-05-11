@@ -179,16 +179,14 @@ struct OccupancyGrid {
             let current = openSet.remove(at: minIdx)
 
             if current.cell == goal {
-                // Reconstruct path.
+                // Reconstruct path: walk cameFrom from goal back to (but not including) start.
+                // Result: [step1, step2, ..., goal] in forward order.
                 var path: [Cell] = []
                 var k = key(goal)
                 while let prev = cameFrom[k] {
-                    let c = Cell(col: prev % OccupancyGrid.cols, row: prev / OccupancyGrid.cols)
                     path.append(Cell(col: k % OccupancyGrid.cols, row: k / OccupancyGrid.cols))
                     k = prev
-                    _ = c
                 }
-                path.append(goal)
                 return path.reversed()
             }
 

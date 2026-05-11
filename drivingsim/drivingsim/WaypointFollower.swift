@@ -17,11 +17,11 @@ enum WaypointFollower {
     // Heading error threshold — within this, drive straight.
     static let alignThreshold:  Float = 0.25   // radians (~14°)
     // Waypoint reach radius — advance to next waypoint when within this.
-    static let reachRadiusM:    Float = 0.4    // metres
+    static let reachRadiusM:    Float = 0.3    // metres
     // Lookahead distance for obstacle safety check in grid cells.
-    static let safetyLookahead: Int   = 4
-    // Number of path cells to skip ahead (thin path compression).
-    static let waypointSkip:    Int   = 3
+    static let safetyLookahead: Int   = 3
+    // Path cells to look ahead — pick a waypoint a few cells out for smoother heading.
+    static let waypointLookahead: Int = 4
 
     /// Returns the DrivingCommand to follow the path given current pose.
     /// Mutates `path` to advance past reached waypoints.
@@ -45,8 +45,8 @@ enum WaypointFollower {
 
         guard !path.isEmpty else { return .brake }
 
-        // Skip ahead in path for smoother curves.
-        let targetIdx = min(waypointSkip, path.count - 1)
+        // Look a few cells ahead from path[0] for smoother heading control.
+        let targetIdx = min(waypointLookahead, path.count - 1)
         let targetCell = path[targetIdx]
         let targetWorld = OccupancyGrid.cellToWorld(targetCell)
 
