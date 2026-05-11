@@ -35,12 +35,13 @@ struct OccupancyGrid {
     static let originX:    Float = -16.0    // world X of cell (0,*)
     static let originZ:    Float = -11.0    // world Z of cell (*,0)
 
-    // Log-odds update values. lOcc small so SINGLE hit ≠ OCCUPIED — requires
-    // multiple consistent hits across frames before a cell goes dark. Kills
-    // single-pixel noise hallucinations. lFree larger so free space confirms
-    // quickly and noise hits get re-cleared by passing rays.
-    private static let lOcc:  Float =  0.45
-    private static let lFree: Float = -0.5
+    // Log-odds update values. Tuned so a real obstacle (hit on most frames)
+    // crosses the OCCUPIED threshold in ~1 frame, but a noise hit gets
+    // cleared by 2 passing free rays. lOcc 0.7, lFree -0.4 — slight lFree
+    // bias keeps maps clean while still letting genuine obstacles register
+    // immediately.
+    private static let lOcc:  Float =  0.7
+    private static let lFree: Float = -0.4
     private static let lMin:  Float = -5.0
     private static let lMax:  Float =  5.0
 

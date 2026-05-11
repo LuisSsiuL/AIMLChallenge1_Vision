@@ -40,13 +40,13 @@ enum DepthProjector {
     static let colStride: Int = 6
     static let rowStride: Int = 6
 
-    // Vertical band: ABOVE horizon only — floor disparity bleeds otherwise.
-    // Horizon roughly at vertical 50% for forward-looking camera at ~6cm.
-    // Sample 15%-46% so we catch obstacles at robot eye height + walls,
-    // exclude the entire floor wedge (which appears close as disparity but
-    // is traversable).
-    static let rowTopFrac:    Float = 0.15
-    static let rowBottomFrac: Float = 0.46
+    // Vertical band: spans from above horizon down to just past it.
+    // Horizon at ~50% for a forward-looking camera at 6cm. Band 20-55%
+    // captures: ceiling-zone walls (top), eye-height obstacles + desk tops
+    // (middle), and a sliver just past horizon (caught objects + wall base).
+    // Excludes the bottom wedge where floor disparity dominates.
+    static let rowTopFrac:    Float = 0.20
+    static let rowBottomFrac: Float = 0.55
 
     // Range per tier.
     static let closeRangeM:    Float = 0.7
@@ -55,9 +55,9 @@ enum DepthProjector {
     static let freeRangeM:     Float = 5.0
 
     // Absolute disparity floor — below this, always free regardless of percentile.
-    // Raised to 80 so only confidently-close pixels stamp obstacles. Cuts the
-    // scatter of low-disparity "maybe close" pixels that hallucinate obstacles.
-    static let absoluteFreeFloorU8: UInt8 = 80
+    // 45 lets real wall/desk pixels through (typical disparity 60-180 in office
+    // scene) while filtering very-far/uncertain low-disparity noise.
+    static let absoluteFreeFloorU8: UInt8 = 45
 
     // Spread guard: if frame is too uniform, treat all as free.
     static let minDepthSpreadU8: Int = 25
