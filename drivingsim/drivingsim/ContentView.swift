@@ -78,16 +78,21 @@ private struct KeyCapView: View {
 }
 
 struct ContentView: View {
+    let source: CameraSource
+
     @StateObject private var keyboard = KeyboardMonitor()
     @StateObject private var hand     = HandJoystick()
     @StateObject private var depth    = DepthDriver()
     @StateObject private var yolo     = YOLODriver()
     @StateObject private var yoloPy   = YOLOPythonDriver()
     @StateObject private var mapDrv   = MapDriver()
+    @StateObject private var liveCam  = LiveCameraSource()
     @State private var mode: DrivingMode = .off
     @State private var scene = SimScene.make()
     @State private var fpv: SimFPVRenderer?
     @State private var fpvTimer: Timer?
+
+    init(source: CameraSource) { self.source = source }
 
     var body: some View {
         RealityView { content in
@@ -105,12 +110,17 @@ struct ContentView: View {
         .frame(minWidth: 900, minHeight: 600)
         .onAppear {
             keyboard.start()
-            // FPV renderer reads the obstacles laid down by SimScene.setup()
-            fpv = SimFPVRenderer(obstacles: scene.obstacleSnapshot,
-                                 personBillboards: scene.personBillboardSnapshot,
-                                 eyeHeight: scene.eyeHeightPublic,
-                                 width: depth.inputSize.width,
-                                 height: depth.inputSize.height)
+            if source.isLive, let uid = source.deviceUniqueID {
+                liveCam.configure(deviceUniqueID: uid)
+                liveCam.start()
+            } else {
+                // Sim source: build offscreen FPV renderer.
+                fpv = SimFPVRenderer(obstacles: scene.obstacleSnapshot,
+                                     personBillboards: scene.personBillboardSnapshot,
+                                     eyeHeight: scene.eyeHeightPublic,
+                                     width: depth.inputSize.width,
+                                     height: depth.inputSize.height)
+            }
         }
         .onDisappear {
             stopAll()
@@ -352,19 +362,25 @@ struct ContentView: View {
     }
 
     private func startFPVTimer() {
-        guard fpvTimer == nil, fpv != nil else { return }
+        guard fpvTimer == nil else { return }
+        if !source.isLive && fpv == nil { return }
         let t = Timer(timeInterval: 1.0 / 30.0, repeats: true) { _ in
             Task { @MainActor in
-                guard let renderer = fpv else { return }
-                let pos = scene.carWorldPosition
-                let yaw = scene.carYaw
-                if let buf = renderer.render(carPosition: pos, yaw: yaw,
-                                              eyeHeight: scene.eyeHeightPublic) {
-                    if mode.needsDepth   { depth.submit(buf) }
-                    if mode.needsYOLO    { yolo.submit(buf) }
-                    if mode.needsYOLOPy  { yoloPy.submit(buf) }
-                    if mode.needsMap     { mapDrv.submit(buf) }
-                }
+                let frameBuf: CVPixelBuffer? = {
+                    if source.isLive {
+                        return liveCam.pullLatest()
+                    } else {
+                        guard let renderer = fpv else { return nil }
+                        return renderer.render(carPosition: scene.carWorldPosition,
+                                                yaw: scene.carYaw,
+                                                eyeHeight: scene.eyeHeightPublic)
+                    }
+                }()
+                guard let buf = frameBuf else { return }
+                if mode.needsDepth   { depth.submit(buf) }
+                if mode.needsYOLO    { yolo.submit(buf) }
+                if mode.needsYOLOPy  { yoloPy.submit(buf) }
+                if mode.needsMap     { mapDrv.submit(buf) }
                 // Sync YOLO seek state into MapDriver seek target.
                 if mode.needsMap {
                     let pose = mapDrv.poseEstimator
@@ -400,6 +416,7 @@ struct ContentView: View {
         yolo.stop()
         yoloPy.stop()
         mapDrv.stop()
+        liveCam.stop()
         scene.stopUpdates()
         stopFPVTimer()
     }

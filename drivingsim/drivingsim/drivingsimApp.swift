@@ -2,16 +2,22 @@
 //  drivingsimApp.swift
 //  drivingsim
 //
-//  Created by Christian Luis Efendy on 06/05/26.
-//
 
 import SwiftUI
 
 @main
 struct drivingsimApp: App {
+    @State private var chosenSource: CameraSource?
+
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            if let src = chosenSource {
+                ContentView(source: src)
+            } else {
+                SourcePickerView { picked in
+                    chosenSource = picked
+                }
+            }
         }
     }
 }
