@@ -39,8 +39,10 @@ final class SimScene {
     private let carHalfZ: Float = 0.10
     private let carBodyY: Float = 0.03   // centre of car body above floor
     // Skin epsilon — gap kept between AABB and obstacle after push-out so
-    // camera (inside AABB) never reaches obstacle surface.
-    private let collisionSkin: Float = 0.01
+    // camera (inside AABB) never reaches obstacle surface. 8cm chosen so
+    // camera stays 9.5cm from wall (8 + 1.5 cam-behind-bumper), well outside
+    // any reasonable near-clipping plane.
+    private let collisionSkin: Float = 0.08
 
     // State
     private var speed: Float = 0
@@ -317,6 +319,10 @@ final class SimScene {
     private func addCamera() {
         cam = PerspectiveCamera()
         cam.camera.fieldOfViewInDegrees = 75
+        // Tight near plane so wall geometry stays visible even at hard collision.
+        // Default RealityKit near is ~0.05m; we want ~0.01m.
+        cam.camera.near = 0.01
+        cam.camera.far  = 1000
         cam.position = [0, carBodyY + eyeHeight, 9.0]
         cam.look(at: [0, carBodyY + eyeHeight, -1], from: cam.position, relativeTo: nil)
         root.addChild(cam)

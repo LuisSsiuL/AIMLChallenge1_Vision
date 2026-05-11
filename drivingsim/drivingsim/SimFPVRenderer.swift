@@ -130,6 +130,9 @@ final class SimFPVRenderer {
         let cam = PerspectiveCamera()
         // ESP32-CAM (OV2640 stock lens) ≈ 65° horizontal FOV.
         cam.camera.fieldOfViewInDegrees = 65
+        // Tight near plane prevents wall culling on hard collisions.
+        cam.camera.near = 0.01
+        cam.camera.far  = 1000
         cam.position = [0, 0.5 + eyeHeight, 0]
         cam.look(at: [0, 0.5 + eyeHeight, -10], from: cam.position, relativeTo: nil)
         renderer.entities.append(cam)
