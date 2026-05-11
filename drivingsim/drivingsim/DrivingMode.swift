@@ -8,16 +8,19 @@
 
 import Foundation
 
-enum DrivingMode: String, CaseIterable, Identifiable {
+enum DrivingMode: String, Identifiable {
     case off         // keyboard only
     case hand        // keyboard + hand
-    case assisted    // depth → W/S; (kb || hand) → A/D
-    case automated   // depth → all four; kb/hand ignored
-    case autoSeek    // depth-sweep (ROAM) ↔ YOLO-drive (SEEK), CoreML backend
-    case autoSeekPy  // same state machine, Python ultralytics subprocess backend
+    case assisted    // depth → W/S; (kb || hand) → A/D  [hidden from picker]
+    case automated   // depth → all four; kb/hand ignored [hidden from picker]
+    case autoSeek    // CoreML YOLO ROAM↔SEEK             [hidden from picker]
+    case autoSeekPy  // Python YOLO ROAM↔SEEK
     case autoMap     // camera-only SLAM: occupancy grid + frontier exploration + A*
 
     var id: String { rawValue }
+
+    // Picker shows only these four.
+    static let allCases: [DrivingMode] = [.off, .hand, .autoSeekPy, .autoMap]
 
     var label: String {
         switch self {
