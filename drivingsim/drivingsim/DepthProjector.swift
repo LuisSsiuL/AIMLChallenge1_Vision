@@ -38,11 +38,15 @@ enum DepthProjector {
 
     // Sampling stride for dense per-pixel ray cast.
     static let colStride: Int = 6
-    static let rowStride: Int = 8
+    static let rowStride: Int = 6
 
-    // Vertical band: middle of image (skip ceiling + floor).
-    static let rowTopFrac:    Float = 0.20
-    static let rowBottomFrac: Float = 0.65
+    // Vertical band: ABOVE horizon only — floor disparity bleeds otherwise.
+    // Horizon roughly at vertical 50% for forward-looking camera at ~6cm.
+    // Sample 15%-46% so we catch obstacles at robot eye height + walls,
+    // exclude the entire floor wedge (which appears close as disparity but
+    // is traversable).
+    static let rowTopFrac:    Float = 0.15
+    static let rowBottomFrac: Float = 0.46
 
     // Range per tier.
     static let closeRangeM:    Float = 0.7
@@ -51,8 +55,9 @@ enum DepthProjector {
     static let freeRangeM:     Float = 5.0
 
     // Absolute disparity floor — below this, always free regardless of percentile.
-    // Prevents marking very-far walls as obstacles in featureless rooms.
-    static let absoluteFreeFloorU8: UInt8 = 25
+    // Raised to 80 so only confidently-close pixels stamp obstacles. Cuts the
+    // scatter of low-disparity "maybe close" pixels that hallucinate obstacles.
+    static let absoluteFreeFloorU8: UInt8 = 80
 
     // Spread guard: if frame is too uniform, treat all as free.
     static let minDepthSpreadU8: Int = 25

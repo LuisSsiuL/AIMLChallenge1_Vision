@@ -35,9 +35,12 @@ struct OccupancyGrid {
     static let originX:    Float = -16.0    // world X of cell (0,*)
     static let originZ:    Float = -11.0    // world Z of cell (*,0)
 
-    // Log-odds update values (Thrun Ch.9 Table 9.2 — boosted for fast visualization).
-    private static let lOcc:  Float =  1.5
-    private static let lFree: Float = -0.3
+    // Log-odds update values. lOcc small so SINGLE hit ≠ OCCUPIED — requires
+    // multiple consistent hits across frames before a cell goes dark. Kills
+    // single-pixel noise hallucinations. lFree larger so free space confirms
+    // quickly and noise hits get re-cleared by passing rays.
+    private static let lOcc:  Float =  0.45
+    private static let lFree: Float = -0.5
     private static let lMin:  Float = -5.0
     private static let lMax:  Float =  5.0
 
