@@ -45,6 +45,7 @@ final class MapDriver: ObservableObject {
     private var currentPath: [Cell] = []
     private var currentGoal: Cell?  = nil
     private var frontierCells: [Cell] = []
+    private var personCells:   [Cell] = []   // last known person positions on map
 
     // Replanning cadence — don't replan every frame (expensive A*).
     private let replanIntervalFrames: Int = 15
@@ -127,6 +128,7 @@ final class MapDriver: ObservableObject {
         currentPath.removeAll()
         currentGoal = nil
         frontierCells.removeAll()
+        personCells.removeAll()
         seekTarget = nil
         framesSinceReplan = 0
         inFlight.withLock { $0 = false }
@@ -148,17 +150,28 @@ final class MapDriver: ObservableObject {
 
     /// Call from SimScene/ContentView when YOLO transitions to .seek.
     /// Pass the normalized detection (cx, cy) + estimated pose to compute world target.
+    /// Called by ContentView each frame when YOLO is in SEEK state.
+    /// Projects detection into world space, updates seekTarget + marks person on map.
     @MainActor
-    func setSeekTarget(detectionCx: Float, detectionCy: Float,
-                       posePos: SIMD2<Float>, poseYaw: Float) {
-        // Approximate world position from detection center and rough depth.
-        // cx=0.5 → straight ahead. Horizontal offset → lateral angle.
-        let angleH = (detectionCx - 0.5) * DepthProjector.fovDeg * .pi / 180.0
+    func updateSeekTarget(detectionCx: Float, detectionCy: Float, detectionH: Float,
+                          posePos: SIMD2<Float>, poseYaw: Float) {
+        // Horizontal angle from camera centre → world ray.
+        let angleH = (detectionCx - 0.5) * DepthProjector.fovDeg * Float.pi / 180.0
         let worldAngle = poseYaw + angleH
-        let estimatedDist: Float = 3.0   // conservative: assume person 3m ahead
+        // Rough distance estimate: if bbox height ≈ 0.55 → person fills frame → ~1m.
+        // Scale inversely: dist ≈ 1 / max(h, 0.05). Clamp to [1, 8]m.
+        let estimatedDist = min(8.0, max(1.0, 0.55 / max(detectionH, 0.05)))
         let tx = posePos.x + sin(worldAngle) * estimatedDist
         let tz = posePos.y - cos(worldAngle) * estimatedDist
-        seekTarget = SIMD2<Float>(tx, tz)
+        let target = SIMD2<Float>(tx, tz)
+        seekTarget = target
+
+        // Mark person cell on map (keep last 5 sightings as a trail).
+        let cell = OccupancyGrid.worldToCell(target)
+        if personCells.last != cell {
+            personCells.append(cell)
+            if personCells.count > 5 { personCells.removeFirst() }
+        }
     }
 
     @MainActor
@@ -263,7 +276,8 @@ final class MapDriver: ObservableObject {
             occupancyImage = grid.toCGImage(
                 robotCell:     robotCell,
                 pathCells:     currentPath,
-                frontierCells: frontierCells
+                frontierCells: frontierCells,
+                personCells:   personCells
             )
         }
     }

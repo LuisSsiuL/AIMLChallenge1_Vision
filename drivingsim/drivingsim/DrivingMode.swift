@@ -19,8 +19,8 @@ enum DrivingMode: String, Identifiable {
 
     var id: String { rawValue }
 
-    // Picker shows only these four.
-    static let allCases: [DrivingMode] = [.off, .hand, .autoSeekPy, .autoMap]
+    // Picker shows only these three — autoMap is the unified final mode.
+    static let allCases: [DrivingMode] = [.off, .hand, .autoMap]
 
     var label: String {
         switch self {
@@ -37,7 +37,7 @@ enum DrivingMode: String, Identifiable {
     var needsHand:    Bool { self == .hand || self == .assisted }
     var needsDepth:   Bool { self == .assisted || self == .automated || self == .autoSeek || self == .autoSeekPy }
     var needsYOLO:    Bool { self == .autoSeek }
-    var needsYOLOPy:  Bool { self == .autoSeekPy }
+    var needsYOLOPy:  Bool { self == .autoSeekPy || self == .autoMap }
     var anyYOLO:      Bool { needsYOLO || needsYOLOPy }
     var needsMap:     Bool { self == .autoMap }
 }

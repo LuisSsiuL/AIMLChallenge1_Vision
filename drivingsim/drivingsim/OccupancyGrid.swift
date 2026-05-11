@@ -213,23 +213,31 @@ struct OccupancyGrid {
     /// Render grid as RGBA CGImage. free=light, occupied=dark, unknown=mid-gray.
     func toCGImage(robotCell: Cell? = nil,
                    pathCells: [Cell] = [],
-                   frontierCells: [Cell] = []) -> CGImage? {
+                   frontierCells: [Cell] = [],
+                   personCells: [Cell] = []) -> CGImage? {
         let W = OccupancyGrid.cols
         let H = OccupancyGrid.rows
         var rgba = [UInt8](repeating: 0, count: W * H * 4)
 
         let frontierSet = Set(frontierCells)
         let pathSet     = Set(pathCells)
+        let personSet   = Set(personCells)
 
         for row in 0..<H {
             for col in 0..<W {
                 let cell = Cell(col: col, row: row)
                 let i = (row * W + col) * 4
                 if let rc = robotCell, rc == cell {
+                    // Robot = red
                     rgba[i]=220; rgba[i+1]=30; rgba[i+2]=30; rgba[i+3]=255
+                } else if personSet.contains(cell) {
+                    // Person target = orange
+                    rgba[i]=255; rgba[i+1]=160; rgba[i+2]=20; rgba[i+3]=255
                 } else if pathSet.contains(cell) {
+                    // Path = green
                     rgba[i]=50; rgba[i+1]=200; rgba[i+2]=50; rgba[i+3]=255
                 } else if frontierSet.contains(cell) {
+                    // Frontier = blue
                     rgba[i]=50; rgba[i+1]=100; rgba[i+2]=220; rgba[i+3]=255
                 } else {
                     switch state(cell) {

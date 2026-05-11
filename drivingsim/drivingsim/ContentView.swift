@@ -185,7 +185,8 @@ struct ContentView: View {
                             .foregroundColor(.white.opacity(0.7))
                     }
                 }
-                if mode.needsYOLOPy {
+                if mode == .autoSeekPy {
+                    // Standalone SeekPy (hidden from picker but reachable by code)
                     VStack(spacing: 4) {
                         YOLOPyPreviewPanel(driver: yoloPy)
                             .frame(width: 240, height: 240)
@@ -198,16 +199,54 @@ struct ContentView: View {
                     }
                 }
                 if mode.needsMap {
-                    VStack(spacing: 4) {
+                    // Unified Map mode: YOLO cam (small) + occupancy map (large)
+                    VStack(spacing: 6) {
+                        // YOLO camera feed with bbox — small thumbnail
+                        ZStack {
+                            YOLOPyPreviewPanel(driver: yoloPy)
+                            // ROAM/SEEK badge bottom-left of thumbnail
+                            VStack {
+                                Spacer()
+                                HStack {
+                                    HStack(spacing: 5) {
+                                        Circle()
+                                            .fill(yoloPy.seekState == .seek ? Color.red : Color.green)
+                                            .frame(width: 7, height: 7)
+                                        Text(yoloPy.seekState == .seek ? "SEEK" : "ROAM")
+                                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                            .foregroundColor(.white)
+                                        if !yoloPy.pythonReady {
+                                            Text("(starting…)")
+                                                .font(.system(size: 9))
+                                                .foregroundColor(.white.opacity(0.6))
+                                        }
+                                    }
+                                    .padding(.horizontal, 6).padding(.vertical, 3)
+                                    .background(.black.opacity(0.6))
+                                    .cornerRadius(5)
+                                    .padding(5)
+                                    Spacer()
+                                }
+                            }
+                        }
+                        .frame(width: 240, height: 135)
+                        .cornerRadius(8)
+                        .overlay(RoundedRectangle(cornerRadius: 8)
+                            .stroke(yoloPy.seekState == .seek ? Color.red.opacity(0.8) : Color.purple.opacity(0.5),
+                                    lineWidth: 2))
+
+                        // Occupancy map — larger
                         MapPreviewPanel(driver: mapDrv)
-                            .frame(width: 240, height: 160)
+                            .frame(width: 240, height: 200)
                             .cornerRadius(8)
                             .overlay(RoundedRectangle(cornerRadius: 8)
                                 .stroke(Color.green.opacity(0.6), lineWidth: 2))
-                        Text("Map (free=light · occ=dark · path=green · frontier=blue)")
+
+                        Text("robot=red · path=green · frontier=blue · person=orange")
                             .font(.caption2)
-                            .foregroundColor(.white.opacity(0.7))
+                            .foregroundColor(.white.opacity(0.6))
                             .multilineTextAlignment(.center)
+                            .frame(width: 240)
                     }
                 }
             }
@@ -313,6 +352,17 @@ struct ContentView: View {
                     if mode.needsYOLO    { yolo.submit(buf) }
                     if mode.needsYOLOPy  { yoloPy.submit(buf) }
                     if mode.needsMap     { mapDrv.submit(buf) }
+                }
+                // Sync YOLO seek state into MapDriver seek target.
+                if mode.needsMap {
+                    let pose = mapDrv.poseEstimator
+                    if yoloPy.seekState == .seek, let det = yoloPy.bestDetection {
+                        mapDrv.updateSeekTarget(
+                            detectionCx: det.cx, detectionCy: det.cy, detectionH: det.h,
+                            posePos: pose.pos, poseYaw: pose.yaw)
+                    } else {
+                        mapDrv.clearSeekTarget()
+                    }
                 }
             }
         }
