@@ -235,6 +235,16 @@ struct ContentView: View {
                             .stroke(yoloPy.seekState == .seek ? Color.red.opacity(0.8) : Color.purple.opacity(0.5),
                                     lineWidth: 2))
 
+                        // DepthAnythingV2 output — what feeds the map ray-cast
+                        MapDepthPanel(driver: mapDrv)
+                            .frame(width: 240, height: 135)
+                            .cornerRadius(8)
+                            .overlay(RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.cyan.opacity(0.6), lineWidth: 2))
+                        Text("DepthAnythingV2")
+                            .font(.caption2)
+                            .foregroundColor(.white.opacity(0.6))
+
                         // Zoomed occupancy map — 6m × 6m window around robot
                         MapPreviewPanel(driver: mapDrv)
                             .frame(width: 320, height: 320)
@@ -432,6 +442,26 @@ private struct MapPreviewPanel: View {
                 Text("Building map…")
                     .font(.caption2)
                     .foregroundColor(.white.opacity(0.8))
+            }
+        }
+    }
+}
+
+/// Colourised depth output from DepthAnythingV2 (Map mode's source for ray-casting).
+private struct MapDepthPanel: View {
+    @ObservedObject var driver: MapDriver
+    var body: some View {
+        ZStack {
+            Color.black
+            if let img = driver.depthImage {
+                Image(decorative: img, scale: 1.0, orientation: .up)
+                    .resizable()
+                    .interpolation(.low)
+                    .aspectRatio(contentMode: .fit)
+            } else {
+                Text("Depth loading…")
+                    .font(.caption2)
+                    .foregroundColor(.white.opacity(0.6))
             }
         }
     }
