@@ -83,6 +83,7 @@ struct ContentView: View {
     @StateObject private var depth    = DepthDriver()
     @StateObject private var yolo     = YOLODriver()
     @StateObject private var yoloPy   = YOLOPythonDriver()
+    @StateObject private var mapDrv   = MapDriver()
     @State private var mode: DrivingMode = .off
     @State private var scene = SimScene.make()
     @State private var fpv: SimFPVRenderer?
@@ -97,6 +98,7 @@ struct ContentView: View {
                 depth: depth,
                 yolo: yolo,
                 yoloPy: yoloPy,
+                map: mapDrv,
                 modeProvider: { mode }
             )
         } update: { _ in }
@@ -195,6 +197,19 @@ struct ContentView: View {
                             .foregroundColor(.white.opacity(0.7))
                     }
                 }
+                if mode.needsMap {
+                    VStack(spacing: 4) {
+                        MapPreviewPanel(driver: mapDrv)
+                            .frame(width: 240, height: 160)
+                            .cornerRadius(8)
+                            .overlay(RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.green.opacity(0.6), lineWidth: 2))
+                        Text("Map (free=light · occ=dark · path=green · frontier=blue)")
+                            .font(.caption2)
+                            .foregroundColor(.white.opacity(0.7))
+                            .multilineTextAlignment(.center)
+                    }
+                }
             }
             .padding(12)
         }
@@ -273,7 +288,12 @@ struct ContentView: View {
         } else {
             yoloPy.stop()
         }
-        if newMode.needsDepth || newMode.anyYOLO {
+        if newMode.needsMap {
+            mapDrv.start()
+        } else {
+            mapDrv.stop()
+        }
+        if newMode.needsDepth || newMode.anyYOLO || newMode.needsMap {
             startFPVTimer()
         } else {
             stopFPVTimer()
@@ -292,6 +312,7 @@ struct ContentView: View {
                     if mode.needsDepth   { depth.submit(buf) }
                     if mode.needsYOLO    { yolo.submit(buf) }
                     if mode.needsYOLOPy  { yoloPy.submit(buf) }
+                    if mode.needsMap     { mapDrv.submit(buf) }
                 }
             }
         }
@@ -310,6 +331,7 @@ struct ContentView: View {
         depth.stop()
         yolo.stop()
         yoloPy.stop()
+        mapDrv.stop()
         scene.stopUpdates()
         stopFPVTimer()
     }
@@ -342,6 +364,25 @@ private struct YOLOPyPreviewPanel: View {
                     .aspectRatio(contentMode: .fit)
             }
             BoundingBoxOverlay(driverPy: driver, aspectFit: true)
+        }
+    }
+}
+
+private struct MapPreviewPanel: View {
+    @ObservedObject var driver: MapDriver
+    var body: some View {
+        ZStack {
+            Color(white: 0.5)   // unknown-gray background before first render
+            if let img = driver.occupancyImage {
+                Image(decorative: img, scale: 1.0, orientation: .up)
+                    .interpolation(.none)   // keep pixel-art sharpness for grid cells
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+            } else {
+                Text("Building map…")
+                    .font(.caption2)
+                    .foregroundColor(.white.opacity(0.8))
+            }
         }
     }
 }

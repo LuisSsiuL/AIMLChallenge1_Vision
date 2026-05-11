@@ -15,6 +15,7 @@ enum DrivingMode: String, CaseIterable, Identifiable {
     case automated   // depth → all four; kb/hand ignored
     case autoSeek    // depth-sweep (ROAM) ↔ YOLO-drive (SEEK), CoreML backend
     case autoSeekPy  // same state machine, Python ultralytics subprocess backend
+    case autoMap     // camera-only SLAM: occupancy grid + frontier exploration + A*
 
     var id: String { rawValue }
 
@@ -26,6 +27,7 @@ enum DrivingMode: String, CaseIterable, Identifiable {
         case .automated:  return "Auto"
         case .autoSeek:   return "Seek"
         case .autoSeekPy: return "SeekPy"
+        case .autoMap:    return "Map"
         }
     }
 
@@ -34,4 +36,5 @@ enum DrivingMode: String, CaseIterable, Identifiable {
     var needsYOLO:    Bool { self == .autoSeek }
     var needsYOLOPy:  Bool { self == .autoSeekPy }
     var anyYOLO:      Bool { needsYOLO || needsYOLOPy }
+    var needsMap:     Bool { self == .autoMap }
 }

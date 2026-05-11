@@ -329,6 +329,7 @@ final class SimScene {
                       depth: DepthDriver,
                       yolo: YOLODriver,
                       yoloPy: YOLOPythonDriver,
+                      map: MapDriver,
                       modeProvider: @escaping @MainActor () -> DrivingMode) {
         guard timer == nil else { return }
         let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
@@ -336,7 +337,7 @@ final class SimScene {
             Task { @MainActor in
                 let m = modeProvider()
                 self.tick(kb: keyboard, hand: hand, depth: depth,
-                          yolo: yolo, yoloPy: yoloPy,
+                          yolo: yolo, yoloPy: yoloPy, map: map,
                           mode: m, dt: 1.0 / 60.0)
             }
         }
@@ -354,6 +355,7 @@ final class SimScene {
                       depth: DepthDriver,
                       yolo: YOLODriver,
                       yoloPy: YOLOPythonDriver,
+                      map: MapDriver,
                       mode: DrivingMode,
                       dt: Float) {
         // Input gating per mode:
@@ -363,10 +365,12 @@ final class SimScene {
         //   .automated   — depth → all four; kb/hand ignored
         //   .autoSeek    — CoreML YOLO ROAM↔SEEK state machine
         //   .autoSeekPy  — Python ultralytics ROAM↔SEEK (same logic)
-        let kbActive   = (mode != .automated && mode != .autoSeek && mode != .autoSeekPy)
+        //   .autoMap     — MapDriver (occupancy grid + frontier A*) all four axes
+        let kbActive   = (mode != .automated && mode != .autoSeek && mode != .autoSeekPy && mode != .autoMap)
         let handActive = (mode == .hand || mode == .assisted)
         let depthWS    = (mode == .assisted || mode == .automated)
         let depthAD    = (mode == .automated)
+        let mapActive  = (mode == .autoMap)
 
         // Pick active YOLO source for this mode.
         let activeYoloSeekState: SeekState
@@ -403,17 +407,21 @@ final class SimScene {
                          || (depthWS && depth.forward)
                          || (inRoam && depth.forward)
                          || yoloFwd
+                         || (mapActive && map.forward)
         let inBackward = (kbActive && kb.backward) || (handActive && hand.backward)
                          || (depthWS && depth.backward)
                          || (inRoam && depth.backward)
+                         || (mapActive && map.backward)
         let inLeft     = (kbActive && kb.left)     || (handActive && hand.left)
                          || (depthAD && depth.left)
                          || (inRoam && depth.left)
                          || yoloLeft
+                         || (mapActive && map.left)
         let inRight    = (kbActive && kb.right)    || (handActive && hand.right)
                          || (depthAD && depth.right)
                          || (inRoam && depth.right)
                          || yoloRight
+                         || (mapActive && map.right)
 
         // ── Throttle / brake ──
         if inForward {
