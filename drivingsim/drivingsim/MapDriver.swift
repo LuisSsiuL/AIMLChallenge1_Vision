@@ -65,6 +65,17 @@ final class MapDriver: ObservableObject {
     // YOLO seek override — when set, A* targets this world position instead of frontier.
     private(set) var seekTarget: SIMD2<Float>? = nil
 
+    // Latest YOLO detection bbox (image-space normalized) — masked from depth obstacles.
+    private var seekBox: DepthProjector.SkipBox? = nil
+
+    // Stuck detection: rolling history of central disparity mean.
+    private var dispHistory: [Float] = []
+    private let dispHistorySize = 12
+    private let stuckDispStdMax: Float = 4.0     // very stable depth
+    private let stuckDispMeanMin: Float = 100.0  // and something close ahead
+    private var stuckReverseFrames: Int = 0
+    private let stuckReverseDuration = 18
+
     // Model (shared inference with DepthDriver pattern)
     nonisolated(unsafe) private var model: MLModel?
     nonisolated(unsafe) private var modelInputName:  String = "image"
@@ -131,6 +142,9 @@ final class MapDriver: ObservableObject {
         frontierCells.removeAll()
         personCells.removeAll()
         seekTarget = nil
+        seekBox = nil
+        dispHistory.removeAll()
+        stuckReverseFrames = 0
         framesSinceReplan = 0
         inFlight.withLock { $0 = false }
         print("[MapDriver] stopped, map cleared")
@@ -153,21 +167,27 @@ final class MapDriver: ObservableObject {
     /// Pass the normalized detection (cx, cy) + estimated pose to compute world target.
     /// Called by ContentView each frame when YOLO is in SEEK state.
     /// Projects detection into world space, updates seekTarget + marks person on map.
+    /// Also stores image-space bbox so DepthProjector can mask out the person.
     @MainActor
-    func updateSeekTarget(detectionCx: Float, detectionCy: Float, detectionH: Float,
+    func updateSeekTarget(detectionCx: Float, detectionCy: Float,
+                          detectionW: Float, detectionH: Float,
                           posePos: SIMD2<Float>, poseYaw: Float) {
-        // Horizontal angle from camera centre → world ray.
         let angleH = (detectionCx - 0.5) * DepthProjector.fovDeg * Float.pi / 180.0
         let worldAngle = poseYaw + angleH
-        // Rough distance estimate: if bbox height ≈ 0.55 → person fills frame → ~1m.
-        // Scale inversely: dist ≈ 1 / max(h, 0.05). Clamp to [1, 8]m.
         let estimatedDist = min(8.0, max(1.0, 0.55 / max(detectionH, 0.05)))
         let tx = posePos.x + sin(worldAngle) * estimatedDist
         let tz = posePos.y - cos(worldAngle) * estimatedDist
         let target = SIMD2<Float>(tx, tz)
         seekTarget = target
 
-        // Mark person cell on map (keep last 5 sightings as a trail).
+        // Image-space bbox — pad slightly to ensure person edges fully masked.
+        let pad: Float = 1.25
+        seekBox = DepthProjector.SkipBox(
+            cx: detectionCx, cy: detectionCy,
+            w:  min(1.0, detectionW * pad),
+            h:  min(1.0, detectionH * pad)
+        )
+
         let cell = OccupancyGrid.worldToCell(target)
         if personCells.last != cell {
             personCells.append(cell)
@@ -176,7 +196,11 @@ final class MapDriver: ObservableObject {
     }
 
     @MainActor
-    func clearSeekTarget() { seekTarget = nil; currentPath.removeAll() }
+    func clearSeekTarget() {
+        seekTarget = nil
+        seekBox = nil
+        currentPath.removeAll()
+    }
 
     // MARK: - Inference (off main actor)
 
@@ -243,10 +267,16 @@ final class MapDriver: ObservableObject {
 
         let pose = (pos: poseEstimator.pos, yaw: poseEstimator.yaw)
 
-        // 1. Ray-cast depth into occupancy grid.
+        // 1. Ray-cast depth into occupancy grid. Mask out YOLO person bbox so
+        //    the tracked target doesn't get stamped as a wall.
         DepthProjector.update(depthU8: depthU8, w: w, h: h,
                               posePos: pose.pos, poseYaw: pose.yaw,
-                              grid: &grid)
+                              grid: &grid, skip: seekBox)
+
+        // 1b. Stuck detection — rolling central-disparity stability check.
+        let centralMean = DepthProjector.centralDisparityMean(depthU8: depthU8, w: w, h: h)
+        dispHistory.append(centralMean)
+        if dispHistory.count > dispHistorySize { dispHistory.removeFirst() }
 
         // 2. Replan at interval.
         framesSinceReplan += 1
@@ -257,9 +287,8 @@ final class MapDriver: ObservableObject {
 
         // 3. Follow current path (or fallback exploration).
         let inflated = grid.inflated(by: inflationRadius)
-        let cmd: DrivingCommand
+        var cmd: DrivingCommand
         if currentPath.isEmpty {
-            // No path → fallback. Look ahead in current heading.
             cmd = fallbackExplore(pose: pose, grid: inflated)
         } else {
             cmd = WaypointFollower.nextCommand(
@@ -270,14 +299,41 @@ final class MapDriver: ObservableObject {
             )
         }
 
-        // 4. Publish keys + command FIRST so SimScene picks them up.
+        // 3b. Stuck override — if commanding forward but depth profile
+        //     stationary + close obstacle present, robot is wedged. Reverse
+        //     for a fixed window, and DO NOT integrate forward into pose
+        //     (otherwise odometry drifts through the wall).
+        var poseShouldIntegrate = true
+        let cmdIsForward = (cmd == .forward || cmd == .forwardLeft || cmd == .forwardRight)
+        if stuckReverseFrames > 0 {
+            stuckReverseFrames -= 1
+            cmd = .reverseLeft   // back away with a turn so next forward differs
+            poseShouldIntegrate = false
+        } else if cmdIsForward, dispHistory.count == dispHistorySize {
+            let mean = dispHistory.reduce(0, +) / Float(dispHistory.count)
+            let variance = dispHistory.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Float(dispHistory.count)
+            let std = sqrtf(variance)
+            if mean > stuckDispMeanMin && std < stuckDispStdMax {
+                stuckReverseFrames = stuckReverseDuration
+                dispHistory.removeAll()        // reset so detection re-arms after reverse
+                cmd = .reverseLeft
+                poseShouldIntegrate = false
+                print(String(format: "[MapDriver] STUCK detected — dispMean=%.1f std=%.2f, reversing", mean, std))
+            }
+        }
+
+        // 4. Publish keys + command.
         command = cmd
         keys    = keysFor(cmd)
         depthImage = preview
 
-        // 5. Update pose estimator with the SAME keys SimScene will read.
-        // Use 1/30 dt — matches FPV+inference loop cadence.
-        poseEstimator.tickFromCommand(keys: keys, dt: 1.0 / 30.0)
+        // 5. Update pose estimator. Skip integration during stuck-reverse so
+        //    estimated pose stops drifting forward through the wall.
+        if poseShouldIntegrate {
+            poseEstimator.tickFromCommand(keys: keys, dt: 1.0 / 30.0)
+        } else {
+            poseEstimator.tickFromCommand(keys: [], dt: 1.0 / 30.0)
+        }
 
         // 6. Render zoomed map overlay (6m×6m window around robot, 4 px/cell).
         framesSinceMapRender += 1

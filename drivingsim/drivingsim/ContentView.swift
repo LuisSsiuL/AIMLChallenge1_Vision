@@ -368,7 +368,8 @@ struct ContentView: View {
                     let pose = mapDrv.poseEstimator
                     if yoloPy.seekState == .seek, let det = yoloPy.bestDetection {
                         mapDrv.updateSeekTarget(
-                            detectionCx: det.cx, detectionCy: det.cy, detectionH: det.h,
+                            detectionCx: det.cx, detectionCy: det.cy,
+                            detectionW:  det.w,  detectionH: det.h,
                             posePos: pose.pos, poseYaw: pose.yaw)
                     } else {
                         mapDrv.clearSeekTarget()
