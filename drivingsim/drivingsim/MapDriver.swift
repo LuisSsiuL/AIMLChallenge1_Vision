@@ -62,10 +62,17 @@ final class MapDriver: ObservableObject {
     private let logEveryFrames: Int = 30
     private var framesSinceLog:  Int = 0
 
-    // YOLO seek override — when set, A* targets this world position instead of frontier.
+    // YOLO seek override — last-known world position of target. Persists
+    // across frames YOLO loses sight (object permanence). Cleared only when
+    // target is reached or after timeout.
     private(set) var seekTarget: SIMD2<Float>? = nil
+    private var seekTargetAge: Int = 0
+    private let seekTargetMaxAge: Int = 1800   // 30 frames/s ≈ 60s timeout
+    private let seekTargetReachRadiusM: Float = 0.6
 
-    // Latest YOLO detection bbox (image-space normalized) — masked from depth obstacles.
+    // Latest YOLO detection bbox (image-space normalized) — masked from depth
+    // obstacles. Cleared every frame YOLO doesn't see — only valid for the
+    // current frame's depth pass.
     private var seekBox: DepthProjector.SkipBox? = nil
 
     // Stuck detection: rolling history of central disparity mean.
@@ -142,6 +149,7 @@ final class MapDriver: ObservableObject {
         frontierCells.removeAll()
         personCells.removeAll()
         seekTarget = nil
+        seekTargetAge = 0
         seekBox = nil
         dispHistory.removeAll()
         stuckReverseFrames = 0
@@ -165,9 +173,8 @@ final class MapDriver: ObservableObject {
 
     /// Call from SimScene/ContentView when YOLO transitions to .seek.
     /// Pass the normalized detection (cx, cy) + estimated pose to compute world target.
-    /// Called by ContentView each frame when YOLO is in SEEK state.
-    /// Projects detection into world space, updates seekTarget + marks person on map.
-    /// Also stores image-space bbox so DepthProjector can mask out the person.
+    /// Called by ContentView when YOLO sees the person THIS frame.
+    /// Updates the persistent seek target world position + per-frame bbox mask.
     @MainActor
     func updateSeekTarget(detectionCx: Float, detectionCy: Float,
                           detectionW: Float, detectionH: Float,
@@ -179,6 +186,7 @@ final class MapDriver: ObservableObject {
         let tz = posePos.y - cos(worldAngle) * estimatedDist
         let target = SIMD2<Float>(tx, tz)
         seekTarget = target
+        seekTargetAge = 0   // reset age — fresh sighting
 
         // Image-space bbox — pad slightly to ensure person edges fully masked.
         let pad: Float = 1.25
@@ -195,9 +203,20 @@ final class MapDriver: ObservableObject {
         }
     }
 
+    /// Called every frame YOLO does NOT see the person. Clears the per-frame
+    /// bbox mask (no person in current frame → no pixels to mask) but PRESERVES
+    /// the persistent seekTarget world position. Robot keeps pathing toward
+    /// last-known location until reached or timeout.
+    @MainActor
+    func clearSeekBox() {
+        seekBox = nil
+    }
+
+    /// Fully wipe target state. Called on mode change / stop.
     @MainActor
     func clearSeekTarget() {
         seekTarget = nil
+        seekTargetAge = 0
         seekBox = nil
         currentPath.removeAll()
     }
@@ -277,6 +296,21 @@ final class MapDriver: ObservableObject {
         let centralMean = DepthProjector.centralDisparityMean(depthU8: depthU8, w: w, h: h)
         dispHistory.append(centralMean)
         if dispHistory.count > dispHistorySize { dispHistory.removeFirst() }
+
+        // 1c. Seek target lifecycle (object permanence).
+        if let t = seekTarget {
+            seekTargetAge += 1
+            let dx = t.x - pose.pos.x
+            let dz = t.y - pose.pos.y
+            let dist = sqrtf(dx * dx + dz * dz)
+            if dist < seekTargetReachRadiusM {
+                print("[MapDriver] seek target reached (\(dist)m) — clearing")
+                clearSeekTarget()
+            } else if seekTargetAge > seekTargetMaxAge {
+                print("[MapDriver] seek target stale (>\(seekTargetMaxAge)f) — clearing")
+                clearSeekTarget()
+            }
+        }
 
         // 2. Replan at interval.
         framesSinceReplan += 1

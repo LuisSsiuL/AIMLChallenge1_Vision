@@ -369,12 +369,17 @@ struct ContentView: View {
                 if mode.needsMap {
                     let pose = mapDrv.poseEstimator
                     if yoloPy.seekState == .seek, let det = yoloPy.bestDetection {
+                        // Person visible: refresh target + bbox mask.
                         mapDrv.updateSeekTarget(
                             detectionCx: det.cx, detectionCy: det.cy,
                             detectionW:  det.w,  detectionH: det.h,
                             posePos: pose.pos, poseYaw: pose.yaw)
                     } else {
-                        mapDrv.clearSeekTarget()
+                        // Person not visible this frame: drop per-frame bbox
+                        // mask but KEEP the persistent seekTarget so the robot
+                        // navigates to last-known position (object permanence).
+                        // MapDriver clears the target when reached or stale.
+                        mapDrv.clearSeekBox()
                     }
                 }
             }
