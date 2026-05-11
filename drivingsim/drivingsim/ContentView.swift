@@ -235,18 +235,18 @@ struct ContentView: View {
                             .stroke(yoloPy.seekState == .seek ? Color.red.opacity(0.8) : Color.purple.opacity(0.5),
                                     lineWidth: 2))
 
-                        // Occupancy map — larger
+                        // Zoomed occupancy map — 6m × 6m window around robot
                         MapPreviewPanel(driver: mapDrv)
-                            .frame(width: 240, height: 200)
+                            .frame(width: 320, height: 320)
                             .cornerRadius(8)
                             .overlay(RoundedRectangle(cornerRadius: 8)
                                 .stroke(Color.green.opacity(0.6), lineWidth: 2))
 
-                        Text("robot=red · path=green · frontier=blue · person=orange")
+                        Text("Map · 6m×6m around robot\nrobot=red · path=green · frontier=blue · person=orange")
                             .font(.caption2)
                             .foregroundColor(.white.opacity(0.6))
                             .multilineTextAlignment(.center)
-                            .frame(width: 240)
+                            .frame(width: 320)
                     }
                 }
             }

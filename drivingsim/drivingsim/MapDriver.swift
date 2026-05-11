@@ -275,16 +275,18 @@ final class MapDriver: ObservableObject {
         // Use 1/30 dt — matches FPV+inference loop cadence.
         poseEstimator.tickFromCommand(keys: keys, dt: 1.0 / 30.0)
 
-        // 6. Render map overlay at lower cadence (CGImage build is expensive).
+        // 6. Render zoomed map overlay (6m×6m window around robot, 4 px/cell).
         framesSinceMapRender += 1
         if framesSinceMapRender >= mapRenderInterval {
             framesSinceMapRender = 0
             let robotCell = OccupancyGrid.worldToCell(pose.pos)
-            occupancyImage = grid.toCGImage(
-                robotCell:     robotCell,
-                pathCells:     currentPath,
-                frontierCells: frontierCells,
-                personCells:   personCells
+            occupancyImage = grid.toZoomedCGImage(
+                centerCell:      robotCell,
+                halfWindowCells: 30,        // 6m × 6m view
+                pixelsPerCell:   4,
+                pathCells:       currentPath,
+                frontierCells:   frontierCells,
+                personCells:     personCells
             )
         }
 

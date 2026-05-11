@@ -35,9 +35,9 @@ struct OccupancyGrid {
     static let originX:    Float = -16.0    // world X of cell (0,*)
     static let originZ:    Float = -11.0    // world Z of cell (*,0)
 
-    // Log-odds update values (Thrun Ch.9 Table 9.2).
-    private static let lOcc:  Float =  0.9
-    private static let lFree: Float = -0.4
+    // Log-odds update values (Thrun Ch.9 Table 9.2 — boosted for fast visualization).
+    private static let lOcc:  Float =  1.5
+    private static let lFree: Float = -0.3
     private static let lMin:  Float = -5.0
     private static let lMax:  Float =  5.0
 
@@ -104,6 +104,13 @@ struct OccupancyGrid {
                 logOdds[ix] = max(OccupancyGrid.lMin, logOdds[ix] + OccupancyGrid.lFree)
             }
         }
+    }
+
+    /// Stamp a single cell as occupied. Used by dense obstacle pass.
+    mutating func stampOccupied(cell: Cell) {
+        guard isValid(cell) else { return }
+        let i = idx(cell)
+        logOdds[i] = min(OccupancyGrid.lMax, logOdds[i] + OccupancyGrid.lOcc)
     }
 
     /// Mark cells along ray as free only (no hit endpoint). Used when ray reaches max range.
@@ -252,6 +259,78 @@ struct OccupancyGrid {
         return CGImage(width: W, height: H,
                        bitsPerComponent: 8, bitsPerPixel: 32,
                        bytesPerRow: W * 4, space: cs,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false,
+                       intent: .defaultIntent)
+    }
+
+    /// Zoomed top-down render centered on `centerCell`. Crops to `halfWindowCells`
+    /// radius and renders each grid cell as `pixelsPerCell` pixels.
+    /// Default: 30-cell radius (3m × 0.1m/cell) = 6m×6m window, 4 px/cell = 240×240 image.
+    func toZoomedCGImage(centerCell: Cell,
+                         halfWindowCells: Int = 30,
+                         pixelsPerCell: Int  = 4,
+                         pathCells: [Cell] = [],
+                         frontierCells: [Cell] = [],
+                         personCells: [Cell]   = []) -> CGImage? {
+        let cellSpan = halfWindowCells * 2 + 1     // window width in cells
+        let pxSide   = cellSpan * pixelsPerCell    // image side in pixels
+        var rgba = [UInt8](repeating: 0, count: pxSide * pxSide * 4)
+
+        let frontierSet = Set(frontierCells)
+        let pathSet     = Set(pathCells)
+        let personSet   = Set(personCells)
+
+        for dr in -halfWindowCells...halfWindowCells {
+            for dc in -halfWindowCells...halfWindowCells {
+                let gridCell = Cell(col: centerCell.col + dc,
+                                    row: centerCell.row + dr)
+
+                // Pick colour for this cell.
+                let r: UInt8; let g: UInt8; let b: UInt8
+                if dr == 0 && dc == 0 {
+                    // Robot
+                    r = 230; g = 30; b = 30
+                } else if personSet.contains(gridCell) {
+                    r = 255; g = 160; b = 20
+                } else if pathSet.contains(gridCell) {
+                    r = 50; g = 200; b = 50
+                } else if frontierSet.contains(gridCell) {
+                    r = 50; g = 100; b = 220
+                } else if !isValid(gridCell) {
+                    r = 90; g = 90; b = 90                  // out-of-grid: dark gray
+                } else {
+                    switch state(gridCell) {
+                    case .free:     r = 240; g = 240; b = 240
+                    case .occupied: r = 20;  g = 20;  b = 20
+                    case .unknown:  r = 140; g = 140; b = 140
+                    }
+                }
+
+                // Image coords: dc=-halfWin → leftmost block, dr=-halfWin → topmost.
+                let imgCol = (dc + halfWindowCells) * pixelsPerCell
+                let imgRow = (dr + halfWindowCells) * pixelsPerCell
+
+                for py in 0..<pixelsPerCell {
+                    for px in 0..<pixelsPerCell {
+                        let i = ((imgRow + py) * pxSide + (imgCol + px)) * 4
+                        rgba[i]   = r
+                        rgba[i+1] = g
+                        rgba[i+2] = b
+                        rgba[i+3] = 255
+                    }
+                }
+            }
+        }
+
+        // Robot heading indicator — draw a small line from centre indicating yaw.
+        // (Caller can render this — we already mark robot cell.)
+
+        let cs = CGColorSpaceCreateDeviceRGB()
+        guard let provider = CGDataProvider(data: Data(rgba) as CFData) else { return nil }
+        return CGImage(width: pxSide, height: pxSide,
+                       bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: pxSide * 4, space: cs,
                        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
                        provider: provider, decode: nil, shouldInterpolate: false,
                        intent: .defaultIntent)

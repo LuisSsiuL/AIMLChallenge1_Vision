@@ -52,6 +52,13 @@ enum DepthProjector {
     static let freeRangeM:     Float = 5.0
 
     /// Main entry: update `grid` from current depth frame at given pose.
+    ///
+    /// Two-pass strategy:
+    ///   PASS A — ray cast per column for free-space sweep (visibility cone).
+    ///   PASS B — dense obstacle stamping: every "obstacle-class" depth pixel in
+    ///            the lower band gets its own world-cell marked occupied. This
+    ///            makes depth-detected obstacles visible as dense clusters even
+    ///            when their distance estimate is rough.
     static func update(depthU8: [UInt8], w: Int, h: Int,
                        posePos: SIMD2<Float>, poseYaw: Float,
                        grid: inout OccupancyGrid) {
@@ -63,54 +70,71 @@ enum DepthProjector {
 
         let startCell = OccupancyGrid.worldToCell(posePos)
 
+        // PASS A — per-column ray for free-space sweep
         var col = 0
-        var hitCount = 0
-        var freeCount = 0
         while col < w {
             defer { col += colStride }
 
-            // Min depth in vertical strip — closest thing in that column direction.
             var minDepth: UInt8 = 255
             for row in stripTop..<stripBot {
                 let v = depthU8[row * w + col]
                 if v < minDepth { minDepth = v }
             }
 
-            // Map u8 → distance + obstacle/free decision.
             let rangeM: Float
             let isObstacle: Bool
             if minDepth <= closeMaxU8 {
-                rangeM = closeRangeM
-                isObstacle = true
+                rangeM = closeRangeM;   isObstacle = true
             } else if minDepth <= midMaxU8 {
-                rangeM = midRangeM
-                isObstacle = true
+                rangeM = midRangeM;     isObstacle = true
             } else if minDepth <= distantMaxU8 {
-                rangeM = distantRangeM
-                isObstacle = true
+                rangeM = distantRangeM; isObstacle = true
             } else {
-                rangeM = freeRangeM
-                isObstacle = false
+                rangeM = freeRangeM;    isObstacle = false
             }
 
-            // Camera-space horizontal angle.
             let uNorm = Float(col) - cx
             let angleFromCenter = atan2(uNorm, fx)
             let worldAngle = poseYaw + angleFromCenter
-
             let rayDirX =  sin(worldAngle)
             let rayDirZ = -cos(worldAngle)
-            let endPos = posePos + SIMD2<Float>(rayDirX, rayDirZ) * rangeM
+            let endPos  = posePos + SIMD2<Float>(rayDirX, rayDirZ) * rangeM
             let endCell = OccupancyGrid.worldToCell(endPos)
 
             if isObstacle {
                 grid.update(from: startCell, to: endCell)
-                hitCount += 1
             } else {
                 grid.updateFreeRay(from: startCell, to: endCell)
-                freeCount += 1
             }
         }
-        _ = hitCount; _ = freeCount   // available for debug logging if needed
+
+        // PASS B — dense obstacle stamping: every close/mid-class pixel in lower
+        // band gets projected to world XZ at its inferred range. Marks the cell
+        // directly so obstacles thicken in the map even with noisy depth.
+        let denseColStride = 8        // every 8th col
+        let denseRowStride = 8        // every 8th row in obstacle band
+        var dcol = 0
+        while dcol < w {
+            defer { dcol += denseColStride }
+            var drow = stripTop
+            while drow < stripBot {
+                defer { drow += denseRowStride }
+                let v = depthU8[drow * w + dcol]
+                let rangeM: Float
+                if v <= closeMaxU8        { rangeM = closeRangeM   }
+                else if v <= midMaxU8     { rangeM = midRangeM     }
+                else if v <= distantMaxU8 { rangeM = distantRangeM }
+                else { continue }   // far/free pixel — skip in dense pass
+
+                let uNorm = Float(dcol) - cx
+                let angleFromCenter = atan2(uNorm, fx)
+                let worldAngle = poseYaw + angleFromCenter
+                let hitPos = posePos
+                    + SIMD2<Float>(sin(worldAngle), -cos(worldAngle)) * rangeM
+                let hitCell = OccupancyGrid.worldToCell(hitPos)
+                // Stamp obstacle directly (no free-line traversal — already done in PASS A).
+                grid.stampOccupied(cell: hitCell)
+            }
+        }
     }
 }
