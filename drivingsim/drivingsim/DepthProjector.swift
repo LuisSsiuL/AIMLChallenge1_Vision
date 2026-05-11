@@ -5,22 +5,19 @@
 //  Projects depth image rays into world space and updates an OccupancyGrid.
 //  Uses pinhole camera model with ESP32-CAM OV2640 FOV (65° horizontal).
 //
-//  DepthAnythingV2 outputs RELATIVE depth normalized per-frame (0-255), so
-//  absolute u8 thresholds don't translate to absolute distances.
+//  DepthAnythingV2 outputs DISPARITY normalized per-frame: large u8 = CLOSE,
+//  small u8 = FAR. Per-frame normalization means absolute u8 thresholds are
+//  meaningless — we use adaptive percentile thresholds over the obstacle
+//  band of the image (excluding floor + ceiling).
 //
-//  Strategy: per-frame adaptive percentile thresholds. We compute the
-//  distribution of depth values in the obstacle strip, then classify each
-//  column's minimum depth against the frame's own statistics:
-//    - bottom 15% of u8 values (closest in frame) → close obstacle at 0.7m
-//    - 15-40%                                     → mid obstacle at 1.6m
-//    - 40-70%                                     → distant obstacle at 3.5m
-//    - top 30% (farthest)                         → free ray to 5m
+//  Vertical band: skip top (ceiling/sky) and bottom (floor near robot).
+//  Robot eye at 6cm above floor, camera looking forward → horizon is around
+//  the vertical middle of the image. Floor pixels below horizon look CLOSE
+//  but are not obstacles (traversable). Sample the obstacle-at-robot-height
+//  band: rows ~25%-60% of image height.
 //
-//  Guard: if the frame is too uniform (no real depth variation), treat all
-//  as free — prevents spurious obstacles from noise in featureless scenes.
-//
-//  Same ray-cast algorithm as Hector SLAM / GMapping, with relative-depth
-//  adaptation in place of metric lidar returns.
+//  Per-column statistic: MAX u8 in the band → largest disparity → closest
+//  thing in that direction. Adaptive percentile classifies how close.
 //
 
 import Darwin
@@ -40,9 +37,11 @@ enum DepthProjector {
     // Ray sampling stride. 4 → 130 rays per frame.
     static let colStride: Int = 4
 
-    // Vertical strip — skip top 25% (ceiling/sky) and bottom 10% (floor near).
+    // Vertical band: obstacles at approximate robot-eye height appear in the
+    // middle horizontal slice. Skip top 25% (ceiling/distant background) and
+    // bottom 40% (floor — looks close as disparity but is traversable).
     static let rowTopFrac:    Float = 0.25
-    static let rowBottomFrac: Float = 0.90
+    static let rowBottomFrac: Float = 0.60
 
     // Range assigned to each obstacle tier.
     static let closeRangeM:    Float = 0.7
@@ -50,11 +49,11 @@ enum DepthProjector {
     static let distantRangeM:  Float = 3.5
     static let freeRangeM:     Float = 5.0
 
-    // Degenerate-frame guard: if depth distribution is too flat, frame has no
-    // useful obstacle info — treat everything as free instead of stamping noise.
+    // Degenerate-frame guard: if disparity range too flat → treat as all free.
     static let minDepthSpreadU8: Int = 30
 
     /// Main entry: update `grid` from current depth frame at given pose.
+    /// Input depthU8 is DISPARITY format (large = close, small = far).
     static func update(depthU8: [UInt8], w: Int, h: Int,
                        posePos: SIMD2<Float>, poseYaw: Float,
                        grid: inout OccupancyGrid) {
@@ -64,50 +63,48 @@ enum DepthProjector {
         let stripBot = Int(Float(h) * rowBottomFrac)
         guard stripBot > stripTop else { return }
 
-        // ── Pass 0: per-column min + frame histogram ───────────────────────
-        // Single sweep across sampled columns: record per-column min depth
-        // AND accumulate histogram for percentile computation.
-        var colMins  = [UInt8](repeating: 255, count: w)
+        // ── Pass 0: per-column MAX (= closest disparity) + frame histogram ──
+        var colMaxes = [UInt8](repeating: 0, count: w)
         var hist     = [Int](repeating: 0, count: 256)
         var col = 0
         while col < w {
             defer { col += colStride }
-            var minDepth: UInt8 = 255
+            var maxDisp: UInt8 = 0
             for row in stripTop..<stripBot {
                 let v = depthU8[row * w + col]
-                if v < minDepth { minDepth = v }
+                if v > maxDisp { maxDisp = v }
                 hist[Int(v)] += 1
             }
-            colMins[col] = minDepth
+            colMaxes[col] = maxDisp
         }
 
-        // ── Compute frame percentiles from histogram ───────────────────────
+        // ── Frame percentiles: P30 / P60 / P85 over band ─────────────────
+        // P85 = top 15% disparity (very close), P60 = next ~25% (mid), etc.
         let total = hist.reduce(0, +)
         guard total > 0 else { return }
-        let p15 = percentile(hist: hist, total: total, frac: 0.15)
-        let p40 = percentile(hist: hist, total: total, frac: 0.40)
-        let p70 = percentile(hist: hist, total: total, frac: 0.70)
+        let p30 = percentile(hist: hist, total: total, frac: 0.30)
+        let p60 = percentile(hist: hist, total: total, frac: 0.60)
+        let p85 = percentile(hist: hist, total: total, frac: 0.85)
 
-        // Degenerate frame: not enough spread → no obstacles can be trusted.
-        let allFree = (Int(p70) - Int(p15)) < minDepthSpreadU8
+        let allFree = (Int(p85) - Int(p30)) < minDepthSpreadU8
 
         let startCell = OccupancyGrid.worldToCell(posePos)
 
-        // ── Per-column ray cast with adaptive classification ───────────────
+        // ── Per-column ray cast with adaptive disparity classification ────
         col = 0
         while col < w {
             defer { col += colStride }
-            let minDepth = colMins[col]
+            let maxDisp = colMaxes[col]
 
             let rangeM: Float
             let isObstacle: Bool
             if allFree {
-                rangeM = freeRangeM;   isObstacle = false
-            } else if minDepth <= p15 {
+                rangeM = freeRangeM;    isObstacle = false
+            } else if maxDisp >= p85 {
                 rangeM = closeRangeM;   isObstacle = true
-            } else if minDepth <= p40 {
+            } else if maxDisp >= p60 {
                 rangeM = midRangeM;     isObstacle = true
-            } else if minDepth <= p70 {
+            } else if maxDisp >= p30 {
                 rangeM = distantRangeM; isObstacle = true
             } else {
                 rangeM = freeRangeM;    isObstacle = false

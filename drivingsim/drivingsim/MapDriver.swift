@@ -220,6 +220,10 @@ final class MapDriver: ObservableObject {
         }
 
         // Reuse DepthDriver's static helpers (same module).
+        // Raw output of DepthAnythingV2 is DISPARITY-format (large value =
+        // CLOSE). Display uses raw so the colourised preview matches the
+        // standard convention (yellow=close, blue=far). DepthProjector
+        // handles the polarity flip internally.
         let (depthU8, w, h) = DepthDriver.depthBufferToU8(outBuf)
         let preview = DepthDriver.colorize(depthU8: depthU8, width: w, height: h)
 
