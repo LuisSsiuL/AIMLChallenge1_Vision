@@ -29,8 +29,9 @@ final class LiveCameraSource: NSObject, ObservableObject {
     /// a preview layer when wanted.
     nonisolated(unsafe) let session = AVCaptureSession()
 
-    private let outputW: Int
-    private let outputH: Int
+    nonisolated(unsafe) private var outputW: Int
+    nonisolated(unsafe) private var outputH: Int
+    nonisolated(unsafe) private var esp32Size: CGSize? = nil
     nonisolated(unsafe) private let videoOutput = AVCaptureVideoDataOutput()
     private let outputQueue = DispatchQueue(label: "livecam.output", qos: .userInitiated)
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
@@ -38,11 +39,25 @@ final class LiveCameraSource: NSObject, ObservableObject {
 
     nonisolated private let bufferStore = BufferStore()
 
-    init(width: Int = 518, height: Int = 518) {
+    init(width: Int = 518, height: Int = 392) {
         self.outputW = width
         self.outputH = height
         super.init()
         configurePool()
+    }
+
+    /// Update target output resolution. Rebuilds the pool.
+    func setOutputSize(width: Int, height: Int) {
+        guard width != outputW || height != outputH else { return }
+        outputW = width
+        outputH = height
+        configurePool()
+    }
+
+    /// Optional ESP32 emulation size — intermediate downsample before scaling
+    /// up to model input size. Set to nil for native quality.
+    func setESP32Profile(_ profile: ESP32Profile) {
+        esp32Size = profile.size
     }
 
     /// Configure the session for a specific AVCaptureDevice (selected by
@@ -138,17 +153,40 @@ extension LiveCameraSource: AVCaptureVideoDataOutputSampleBufferDelegate {
         guard let raw = CMSampleBufferGetImageBuffer(sampleBuffer),
               let pool = self.pool else { return }
 
-        let srcW = CGFloat(CVPixelBufferGetWidth(raw))
-        let srcH = CGFloat(CVPixelBufferGetHeight(raw))
-        let side = min(srcW, srcH)
-        let xOff = (srcW - side) / 2
-        let yOff = (srcH - side) / 2
+        // Centre-crop input to the model's aspect ratio (outputW : outputH),
+        // then scale to outputW × outputH. Handles any source resolution.
+        let srcW    = CGFloat(CVPixelBufferGetWidth(raw))
+        let srcH    = CGFloat(CVPixelBufferGetHeight(raw))
+        let dstAR   = CGFloat(outputW) / CGFloat(outputH)
+        let cropW: CGFloat
+        let cropH: CGFloat
+        if srcW / srcH > dstAR {
+            cropH = srcH;     cropW = srcH * dstAR
+        } else {
+            cropW = srcW;     cropH = srcW / dstAR
+        }
+        let xOff = (srcW - cropW) / 2
+        let yOff = (srcH - cropH) / 2
 
-        let ci = CIImage(cvPixelBuffer: raw)
-            .cropped(to: CGRect(x: xOff, y: yOff, width: side, height: side))
+        var ci = CIImage(cvPixelBuffer: raw)
+            .cropped(to: CGRect(x: xOff, y: yOff, width: cropW, height: cropH))
             .transformed(by: CGAffineTransform(translationX: -xOff, y: -yOff))
-            .transformed(by: CGAffineTransform(scaleX: CGFloat(outputW) / side,
-                                                y: CGFloat(outputH) / side))
+
+        // Optional ESP32 emulation: downsample then upsample to simulate the
+        // quality loss of streaming from an ESP32-CAM at limited resolution.
+        if let esp = esp32Size {
+            let downX = esp.width  / cropW
+            let downY = esp.height / cropH
+            ci = ci.transformed(by: CGAffineTransform(scaleX: downX, y: downY))
+            // Force the downsample to materialise so we genuinely lose detail.
+            // Then upsample back to model size.
+            let upX = CGFloat(outputW) / esp.width
+            let upY = CGFloat(outputH) / esp.height
+            ci = ci.transformed(by: CGAffineTransform(scaleX: upX, y: upY))
+        } else {
+            ci = ci.transformed(by: CGAffineTransform(scaleX: CGFloat(outputW) / cropW,
+                                                      y: CGFloat(outputH) / cropH))
+        }
 
         var dst: CVPixelBuffer?
         CVPixelBufferPoolCreatePixelBuffer(nil, pool, &dst)

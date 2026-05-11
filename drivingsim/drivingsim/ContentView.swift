@@ -80,6 +80,7 @@ private struct KeyCapView: View {
 
 struct ContentView: View {
     let source: CameraSource
+    let esp32Profile: ESP32Profile
 
     @StateObject private var keyboard = KeyboardMonitor()
     @StateObject private var hand     = HandJoystick()
@@ -93,7 +94,10 @@ struct ContentView: View {
     @State private var fpv: SimFPVRenderer?
     @State private var fpvTimer: Timer?
 
-    init(source: CameraSource) { self.source = source }
+    init(source: CameraSource, esp32Profile: ESP32Profile = .none) {
+        self.source = source
+        self.esp32Profile = esp32Profile
+    }
 
     @ViewBuilder
     private var mainView: some View {
@@ -128,6 +132,11 @@ struct ContentView: View {
         .onAppear {
             keyboard.start()
             if source.isLive, let uid = source.deviceUniqueID {
+                // Match model's actual input size (518×392 for DepthAnythingV2),
+                // not a hardcoded square. Apply ESP32 profile if user picked one.
+                liveCam.setOutputSize(width:  mapDrv.inputSize.width,
+                                       height: mapDrv.inputSize.height)
+                liveCam.setESP32Profile(esp32Profile)
                 liveCam.configure(deviceUniqueID: uid)
                 liveCam.start()
             } else {

@@ -13,6 +13,45 @@
 @preconcurrency import AVFoundation
 import Foundation
 
+/// ESP32-CAM common resolution profile — applied as an intermediate
+/// downsample step in LiveCameraSource to simulate the quality of an
+/// ESP32-CAM stream (downsample → upsample to model input).
+enum ESP32Profile: String, CaseIterable, Identifiable {
+    case none      // no downsample — native cam quality
+    case qqvga     // 160 × 120
+    case qvga      // 320 × 240
+    case hvga      // 480 × 320
+    case vga       // 640 × 480
+    case svga      // 800 × 600
+    case xga       // 1024 × 768
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .none:  return "Native (no ESP32 sim)"
+        case .qqvga: return "ESP32 QQVGA 160×120"
+        case .qvga:  return "ESP32 QVGA 320×240"
+        case .hvga:  return "ESP32 HVGA 480×320"
+        case .vga:   return "ESP32 VGA 640×480"
+        case .svga:  return "ESP32 SVGA 800×600"
+        case .xga:   return "ESP32 XGA 1024×768"
+        }
+    }
+
+    var size: CGSize? {
+        switch self {
+        case .none:  return nil
+        case .qqvga: return CGSize(width: 160,  height: 120)
+        case .qvga:  return CGSize(width: 320,  height: 240)
+        case .hvga:  return CGSize(width: 480,  height: 320)
+        case .vga:   return CGSize(width: 640,  height: 480)
+        case .svga:  return CGSize(width: 800,  height: 600)
+        case .xga:   return CGSize(width: 1024, height: 768)
+        }
+    }
+}
+
 enum CameraSource: Hashable, Identifiable {
     case sim
     case live(uniqueID: String, name: String)

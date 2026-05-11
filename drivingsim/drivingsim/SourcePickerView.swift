@@ -10,10 +10,11 @@
 import SwiftUI
 
 struct SourcePickerView: View {
-    let onPick: (CameraSource) -> Void
+    let onPick: (CameraSource, ESP32Profile) -> Void
 
     @State private var sources: [CameraSource] = []
     @State private var selection: CameraSource?
+    @State private var esp32: ESP32Profile = .none
 
     var body: some View {
         VStack(spacing: 18) {
@@ -63,19 +64,34 @@ struct SourcePickerView: View {
                 }
             }
 
+            // ESP32-CAM resolution emulation (applies only to live camera sources).
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Stream profile (live cameras only)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Picker("Profile", selection: $esp32) {
+                    ForEach(ESP32Profile.allCases) { p in
+                        Text(p.label).tag(p)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .disabled(selection == .sim)
+            }
+
             HStack {
                 Button("Rescan") { rescan() }
                     .keyboardShortcut("r")
                 Spacer()
                 Button("Continue") {
-                    if let s = selection { onPick(s) }
+                    if let s = selection { onPick(s, esp32) }
                 }
                 .keyboardShortcut(.defaultAction)
                 .disabled(selection == nil)
             }
         }
         .padding(24)
-        .frame(width: 420, height: 460)
+        .frame(width: 460, height: 540)
         .onAppear { rescan() }
     }
 
