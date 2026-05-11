@@ -93,18 +93,30 @@ struct OccupancyGrid {
     }
 
     // MARK: - Bayesian ray-cast update (Bresenham line)
+    //
+    // Truncated ray casting: when traversing free cells along the ray, if we
+    // encounter a cell already confidently OCCUPIED, we stop. This preserves
+    // previously-mapped obstacles from being cleared by rays whose new
+    // endpoint estimate happens to lie behind them. Standard technique in
+    // occupancy grid SLAM (Thrun "Probabilistic Robotics" §9.2, GMapping).
+
+    /// log-odds threshold above which a cell is treated as "confirmed
+    /// occupied" — free rays stop here, don't clear it.
+    private static let confirmedOccLogOdds: Float = 1.5
 
     mutating func update(from start: Cell, to end: Cell) {
-        // Mark all cells along the ray FREE, endpoint OCCUPIED.
+        // Mark cells along the ray FREE up to (and excluding) the endpoint,
+        // then OCCUPY the endpoint. Stop early on confirmed occupied cell.
         let cells = bresenham(start, end)
         for (i, cell) in cells.enumerated() {
             guard isValid(cell) else { continue }
             let ix = idx(cell)
             if i == cells.count - 1 {
-                // Hit point: mark occupied.
+                // Endpoint: mark occupied.
                 logOdds[ix] = min(OccupancyGrid.lMax, logOdds[ix] + OccupancyGrid.lOcc)
             } else {
-                // Free space along ray.
+                // Stop free update at first confirmed obstacle (shadowing).
+                if logOdds[ix] > OccupancyGrid.confirmedOccLogOdds { break }
                 logOdds[ix] = max(OccupancyGrid.lMin, logOdds[ix] + OccupancyGrid.lFree)
             }
         }
@@ -117,11 +129,13 @@ struct OccupancyGrid {
         logOdds[i] = min(OccupancyGrid.lMax, logOdds[i] + OccupancyGrid.lOcc)
     }
 
-    /// Mark cells along ray as free only (no hit endpoint). Used when ray reaches max range.
+    /// Mark cells along ray as free only (no hit endpoint). Stops at first
+    /// confirmed obstacle so previously-mapped walls don't get cleared.
     mutating func updateFreeRay(from start: Cell, to end: Cell) {
         for cell in bresenham(start, end) {
             guard isValid(cell) else { continue }
             let ix = idx(cell)
+            if logOdds[ix] > OccupancyGrid.confirmedOccLogOdds { break }
             logOdds[ix] = max(OccupancyGrid.lMin, logOdds[ix] + OccupancyGrid.lFree)
         }
     }

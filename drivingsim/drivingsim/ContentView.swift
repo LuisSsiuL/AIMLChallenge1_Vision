@@ -252,10 +252,12 @@ struct ContentView: View {
                             .overlay(RoundedRectangle(cornerRadius: 8)
                                 .stroke(Color.green.opacity(0.6), lineWidth: 2))
 
-                        Text("Map · 6m×6m around robot\nrobot=red · path=green · frontier=blue · person=orange")
+                        Text("Map · 6m × 6m around robot")
                             .font(.caption2)
-                            .foregroundColor(.white.opacity(0.6))
-                            .multilineTextAlignment(.center)
+                            .foregroundColor(.white.opacity(0.7))
+                            .frame(width: 320)
+
+                        MapLegend()
                             .frame(width: 320)
                     }
                 }
@@ -445,6 +447,42 @@ private struct MapPreviewPanel: View {
                     .foregroundColor(.white.opacity(0.8))
             }
         }
+    }
+}
+
+/// Two-column legend below the map: colour swatch + label.
+private struct MapLegend: View {
+    private struct Item { let color: Color; let label: String }
+    private let items: [Item] = [
+        Item(color: Color(red: 0.90, green: 0.12, blue: 0.12), label: "Robot"),
+        Item(color: Color(red: 1.00, green: 0.63, blue: 0.08), label: "Person"),
+        Item(color: Color(red: 0.20, green: 0.78, blue: 0.20), label: "Planned path"),
+        Item(color: Color(red: 0.20, green: 0.39, blue: 0.86), label: "Frontier (unexplored edge)"),
+        Item(color: Color(red: 0.08, green: 0.08, blue: 0.08), label: "Obstacle"),
+        Item(color: Color(white: 0.94),                         label: "Free space"),
+        Item(color: Color(white: 0.55),                         label: "Unknown"),
+        Item(color: Color(white: 0.35),                         label: "Out of grid"),
+    ]
+    var body: some View {
+        let columns = [GridItem(.flexible(), alignment: .leading),
+                       GridItem(.flexible(), alignment: .leading)]
+        LazyVGrid(columns: columns, alignment: .leading, spacing: 4) {
+            ForEach(0..<items.count, id: \.self) { i in
+                HStack(spacing: 6) {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(items[i].color)
+                        .frame(width: 12, height: 12)
+                        .overlay(RoundedRectangle(cornerRadius: 2)
+                            .stroke(Color.white.opacity(0.25), lineWidth: 0.5))
+                    Text(items[i].label)
+                        .font(.system(size: 10))
+                        .foregroundColor(.white.opacity(0.85))
+                }
+            }
+        }
+        .padding(8)
+        .background(.black.opacity(0.4))
+        .cornerRadius(6)
     }
 }
 
