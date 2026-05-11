@@ -81,7 +81,7 @@ final class DepthDriver: ObservableObject {
     private let reverseEscapeFrames: Int   = 8
     // Navigation gamma (v7) — applied to depth values used for zone scoring.
     // < 1 brightens / compresses, making close-range obstacles more discriminating.
-    private let navigationGamma: Float = 0.8
+    private let navigationGamma: Float = 1
     // Close-range reverse safety (v6)
     private let reverseBlockedCenterThreshold:    Float = 70
     private let reverseBlockedMinNearZones:       Int   = 5
@@ -1060,7 +1060,10 @@ final class DepthDriver: ObservableObject {
         guard !depthU8.isEmpty else { return nil }
         var rgba = [UInt8](repeating: 0, count: width * height * 4)
         for i in 0..<depthU8.count {
-            let v = Float(depthU8[i]) / 255.0
+            // Display gamma < 1 stretches low end → preview brightens. Raw u8
+            // buffer used by DepthProjector / zone scorer is unchanged.
+            let raw = Float(depthU8[i]) / 255.0
+            let v   = powf(raw, 0.55)
             // Inferno-ish: dark→purple→red→orange→yellow
             let r = UInt8(min(255, max(0, v * 255.0 * 1.0)))
             let g = UInt8(min(255, max(0, (v - 0.3) * 255.0 * 1.4)))
