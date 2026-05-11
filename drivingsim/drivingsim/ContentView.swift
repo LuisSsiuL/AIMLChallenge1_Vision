@@ -3,6 +3,7 @@
 //  drivingsim
 //
 
+import AVFoundation
 import SwiftUI
 import RealityKit
 
@@ -94,19 +95,35 @@ struct ContentView: View {
 
     init(source: CameraSource) { self.source = source }
 
+    @ViewBuilder
+    private var mainView: some View {
+        if source.isLive {
+            // Live camera FPV — no sim, no driving. Black background fills
+            // letterbox when AVCaptureVideoPreviewLayer aspect-fits.
+            ZStack {
+                Color.black
+                CameraPreview(session: liveCam.session,
+                              mirror: false,
+                              videoGravity: .resizeAspect)
+            }
+        } else {
+            RealityView { content in
+                content.add(scene.root)
+                scene.startUpdates(
+                    keyboard: keyboard,
+                    hand: hand,
+                    depth: depth,
+                    yolo: yolo,
+                    yoloPy: yoloPy,
+                    map: mapDrv,
+                    modeProvider: { mode }
+                )
+            } update: { _ in }
+        }
+    }
+
     var body: some View {
-        RealityView { content in
-            content.add(scene.root)
-            scene.startUpdates(
-                keyboard: keyboard,
-                hand: hand,
-                depth: depth,
-                yolo: yolo,
-                yoloPy: yoloPy,
-                map: mapDrv,
-                modeProvider: { mode }
-            )
-        } update: { _ in }
+        mainView
         .frame(minWidth: 900, minHeight: 600)
         .onAppear {
             keyboard.start()
