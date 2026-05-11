@@ -33,6 +33,7 @@ final class SimFPVRenderer {
     private(set) var latestPixelBuffer: CVPixelBuffer?
 
     init?(obstacles: [(pos: SIMD3<Float>, halfX: Float, halfZ: Float, height: Float)],
+          personBillboards: [(pos: SIMD3<Float>, width: Float, height: Float, textureName: String)] = [],
           eyeHeight: Float,
           width: Int = 518,
           height: Int = 518) {
@@ -98,6 +99,26 @@ final class SimFPVRenderer {
             renderer.entities.append(ent)
         }
 
+        // Textured person billboards — must look like a person to YOLO.
+        for p in personBillboards {
+            let mesh = MeshResource.generatePlane(width: p.width, height: p.height)
+            var mat = UnlitMaterial(color: .white)
+            if let tex = try? TextureResource.load(named: p.textureName) {
+                mat.color = .init(tint: .white, texture: .init(tex))
+            } else {
+                print("[SimFPVRenderer] texture \(p.textureName) not found")
+                mat = UnlitMaterial(color: NSColor.systemPink)
+            }
+            let front = ModelEntity(mesh: mesh, materials: [mat])
+            front.position = p.pos
+            front.orientation = simd_quatf(angle: .pi, axis: [0, 1, 0])
+            renderer.entities.append(front)
+            let back = ModelEntity(mesh: mesh, materials: [mat])
+            back.position = p.pos
+            back.orientation = simd_quatf(angle: 0, axis: [0, 1, 0])
+            renderer.entities.append(back)
+        }
+
         // Car proxy — anchor for camera; not rendered (clear material, tiny).
         let proxyMesh = MeshResource.generateSphere(radius: 0.001)
         carProxy = ModelEntity(mesh: proxyMesh,
@@ -127,7 +148,7 @@ final class SimFPVRenderer {
         fill.orientation = simd_quatf(angle: .pi / 5, axis: [-1, 0, 0])
         renderer.entities.append(fill)
 
-        print("[SimFPVRenderer] initialised \(width)x\(height) with \(obstacles.count) obstacles")
+        print("[SimFPVRenderer] initialised \(width)x\(height) with \(obstacles.count) obstacles + \(personBillboards.count) person billboards")
     }
 
     /// Render one frame. Returns the produced CVPixelBuffer or nil on failure.

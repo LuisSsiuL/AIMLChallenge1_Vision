@@ -81,6 +81,8 @@ struct ContentView: View {
     @StateObject private var keyboard = KeyboardMonitor()
     @StateObject private var hand     = HandJoystick()
     @StateObject private var depth    = DepthDriver()
+    @StateObject private var yolo     = YOLODriver()
+    @StateObject private var yoloPy   = YOLOPythonDriver()
     @State private var mode: DrivingMode = .off
     @State private var scene = SimScene.make()
     @State private var fpv: SimFPVRenderer?
@@ -93,6 +95,8 @@ struct ContentView: View {
                 keyboard: keyboard,
                 hand: hand,
                 depth: depth,
+                yolo: yolo,
+                yoloPy: yoloPy,
                 modeProvider: { mode }
             )
         } update: { _ in }
@@ -101,6 +105,7 @@ struct ContentView: View {
             keyboard.start()
             // FPV renderer reads the obstacles laid down by SimScene.setup()
             fpv = SimFPVRenderer(obstacles: scene.obstacleSnapshot,
+                                 personBillboards: scene.personBillboardSnapshot,
                                  eyeHeight: scene.eyeHeightPublic,
                                  width: depth.inputSize.width,
                                  height: depth.inputSize.height)
@@ -109,6 +114,13 @@ struct ContentView: View {
             stopAll()
         }
         .onChange(of: mode) { _, newMode in updateMode(newMode) }
+        .overlay {
+            if mode.needsYOLO {
+                BoundingBoxOverlay(driver: yolo, aspectFit: false)
+            } else if mode.needsYOLOPy {
+                BoundingBoxOverlay(driverPy: yoloPy, aspectFit: false)
+            }
+        }
         .overlay(alignment: .bottomLeading) {
             VStack(alignment: .leading, spacing: 6) {
                 Text("W/S accel-brake   A/D steer")
@@ -159,6 +171,30 @@ struct ContentView: View {
                             .foregroundColor(.white.opacity(0.7))
                     }
                 }
+                if mode.needsYOLO {
+                    VStack(spacing: 4) {
+                        YOLOPreviewPanel(driver: yolo)
+                            .frame(width: 240, height: 240)
+                            .cornerRadius(8)
+                            .overlay(RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.orange.opacity(0.6), lineWidth: 2))
+                        Text("YOLO/CoreML (\(yolo.seekState == .seek ? "SEEK" : "ROAM"))")
+                            .font(.caption2)
+                            .foregroundColor(.white.opacity(0.7))
+                    }
+                }
+                if mode.needsYOLOPy {
+                    VStack(spacing: 4) {
+                        YOLOPyPreviewPanel(driver: yoloPy)
+                            .frame(width: 240, height: 240)
+                            .cornerRadius(8)
+                            .overlay(RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.purple.opacity(0.6), lineWidth: 2))
+                        Text("YOLO/Python (\(yoloPy.seekState == .seek ? "SEEK" : "ROAM"))\(yoloPy.pythonReady ? "" : " starting…")")
+                            .font(.caption2)
+                            .foregroundColor(.white.opacity(0.7))
+                    }
+                }
             }
             .padding(12)
         }
@@ -177,10 +213,24 @@ struct ContentView: View {
         }
     }
 
+    private var activeYoloSeek: SeekState {
+        if mode == .autoSeek { return yolo.seekState }
+        if mode == .autoSeekPy { return yoloPy.seekState }
+        return .roam
+    }
+    private var activeYoloBest: PersonDetection? {
+        if mode == .autoSeek { return yolo.bestDetection }
+        if mode == .autoSeekPy { return yoloPy.bestDetection }
+        return nil
+    }
+    private var seekActive: Bool { mode.anyYOLO && activeYoloSeek == .seek }
+    private var roamActive: Bool { mode.anyYOLO && activeYoloSeek == .roam }
+
     private var anyForward:  Bool {
         keyboard.forward
         || (mode.needsHand  && hand.forward)
         || (mode.needsDepth && depth.forward)
+        || (seekActive && (activeYoloBest?.h ?? 1) < 0.55)
     }
     private var anyBackward: Bool {
         keyboard.backward
@@ -191,11 +241,15 @@ struct ContentView: View {
         keyboard.left
         || (mode.needsHand  && hand.left)
         || (mode == .automated && depth.left)
+        || (roamActive && depth.left)
+        || (seekActive && (activeYoloBest?.cx ?? 0.5) < 0.45)
     }
     private var anyRight:    Bool {
         keyboard.right
         || (mode.needsHand  && hand.right)
         || (mode == .automated && depth.right)
+        || (roamActive && depth.right)
+        || (seekActive && (activeYoloBest?.cx ?? 0.5) > 0.55)
     }
 
     private func updateMode(_ newMode: DrivingMode) {
@@ -206,9 +260,22 @@ struct ContentView: View {
         }
         if newMode.needsDepth {
             depth.start()
-            startFPVTimer()
         } else {
             depth.stop()
+        }
+        if newMode.needsYOLO {
+            yolo.start()
+        } else {
+            yolo.stop()
+        }
+        if newMode.needsYOLOPy {
+            yoloPy.start()
+        } else {
+            yoloPy.stop()
+        }
+        if newMode.needsDepth || newMode.anyYOLO {
+            startFPVTimer()
+        } else {
             stopFPVTimer()
         }
     }
@@ -222,7 +289,9 @@ struct ContentView: View {
                 let yaw = scene.carYaw
                 if let buf = renderer.render(carPosition: pos, yaw: yaw,
                                               eyeHeight: scene.eyeHeightPublic) {
-                    depth.submit(buf)
+                    if mode.needsDepth   { depth.submit(buf) }
+                    if mode.needsYOLO    { yolo.submit(buf) }
+                    if mode.needsYOLOPy  { yoloPy.submit(buf) }
                 }
             }
         }
@@ -239,7 +308,40 @@ struct ContentView: View {
         keyboard.stop()
         hand.stop()
         depth.stop()
+        yolo.stop()
+        yoloPy.stop()
         scene.stopUpdates()
         stopFPVTimer()
+    }
+}
+
+// Small wrapper view to show YOLO input frame + bbox overlay together.
+private struct YOLOPreviewPanel: View {
+    @ObservedObject var driver: YOLODriver
+    var body: some View {
+        ZStack {
+            Color.black
+            if let img = driver.previewImage {
+                Image(decorative: img, scale: 1.0, orientation: .up)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+            }
+            BoundingBoxOverlay(driver: driver, aspectFit: true)
+        }
+    }
+}
+
+private struct YOLOPyPreviewPanel: View {
+    @ObservedObject var driver: YOLOPythonDriver
+    var body: some View {
+        ZStack {
+            Color.black
+            if let img = driver.previewImage {
+                Image(decorative: img, scale: 1.0, orientation: .up)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+            }
+            BoundingBoxOverlay(driverPy: driver, aspectFit: true)
+        }
     }
 }

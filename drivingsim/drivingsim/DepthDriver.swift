@@ -2,9 +2,9 @@
 //  DepthDriver.swift
 //  drivingsim
 //
-//  Native Swift port of live_depth_mlmodel_wasd 7.py.
-//  v7: navigation gamma 0.6 applied to depth before zone scoring
-//  (brightens close-range, makes low scores more discriminating).
+//  Native Swift port of live_depth_mlmodel_wasd 11.py.
+//  v11: split must-reverse into hard/soft with grace+hold, static-stuck
+//  gated by center<145, navigation gamma 0.6→0.8, threshold 20→16.
 //  Takes CVPixelBuffer frames (518×518 from SimFPVRenderer),
 //  runs DepthAnythingV2 SmallF16 CoreML model, computes 7×7 zone grid
 //  (FAR row top 40% + NEAR row bottom 60% of ROI, 7 columns each),
@@ -81,12 +81,39 @@ final class DepthDriver: ObservableObject {
     private let reverseEscapeFrames: Int   = 8
     // Navigation gamma (v7) — applied to depth values used for zone scoring.
     // < 1 brightens / compresses, making close-range obstacles more discriminating.
-    private let navigationGamma: Float = 0.6
+    private let navigationGamma: Float = 0.8
     // Close-range reverse safety (v6)
     private let reverseBlockedCenterThreshold:    Float = 70
     private let reverseBlockedMinNearZones:       Int   = 5
     private let reverseBlockedConfirmFrames:      Int   = 3
     private let reverseImmediateCenterThreshold: Float = 40
+    // Static-stuck detection (v9, threshold tightened in v11): low depth temporal change → not moving
+    private let staticStuckDiffThreshold:   Float = 16.0
+    private let staticStuckConfirmFrames:   Int   = 12
+    private let staticStuckCenterMax:       Float = 145.0   // v11: only count if center not wide-open
+    private let staticStuckUseNavRoi:       Bool  = true
+    // Soft-stuck (v10): center weak + both sides weak for N frames → reverse
+    private let softStuckEnabled:         Bool  = true
+    private let softStuckCenterThreshold: Float = 120.0
+    private let softStuckSideThreshold:   Float = 155.0
+    private let softStuckConfirmFrames:   Int   = 8
+    private let softStuckTurnMargin:      Float = 8.0
+    // v11: hold + grace counters around soft reverse
+    private let softReverseHoldFrames:        Int = 4
+    private let postReverseSoftGraceFrames:   Int = 10
+    // PID steering anti-wobble (v9)
+    private let pidEnabled:         Bool  = true
+    private let pidKp:              Float = 0.35
+    private let pidKi:              Float = 0.025
+    private let pidKd:              Float = 0.18
+    private let pidIntegralClamp:   Float = 180.0
+    private let pidOutputClamp:     Float = 35.0
+    private let pidDeadband:        Float = 2.0
+    private let pidBonusScale:      Float = 1.0
+    private let pidDtDefault:       Double = 1.0 / 15.0
+    // Hard-exit redirect safety (v9): opposite side must be clearly viable
+    private let exitHardBlockMinOppositeAvg: Float = 145.0
+    private let exitHardBlockMaxDeficit:     Float = 18.0
     // Exploration / inward-bias
     private let explorationEnabled:     Bool  = true
     // Exit avoidance (anti-open-space lure)
@@ -107,6 +134,23 @@ final class DepthDriver: ObservableObject {
     private let loopReverseWindow:      Int   = 60
     private let loopReverseThreshold:   Int   = 3
     private let loopBreakerFramesMax:   Int   = 20
+    // Coverage sweep (Roomba-style) — explore.py
+    private let coverageModeEnabled:           Bool  = true
+    private let coveragePlateauDiffThreshold:  Float = 8.0
+    private let coveragePlateauConfirmFrames:  Int   = 18
+    private let coverageOpenCenterThreshold:   Float = 145.0
+    private let coverageOpenSideThreshold:     Float = 140.0
+    private let coverageSweepFramesCount:      Int   = 14
+    private let coverageSweepCooldownFrames:   Int   = 36
+    // Doorway commit — explore.py
+    private let doorwayCommitEnabled:        Bool  = true
+    private let doorwayCommitMinFarScore:    Float = 135.0
+    private let doorwayCommitMaxWidth:       Int   = 3
+    private let doorwayCommitFramesCount:    Int   = 10
+    private let doorwayCommitMinNearCenter:  Float = 105.0
+    private let doorwayCommitCancelCenter:   Float = 90.0
+    private let doorwayCommitLeftEdge:       Float = 2.8
+    private let doorwayCommitRightEdge:      Float = 4.2
 
     // Perception state.
     private var consecutiveReverse = 0
@@ -121,6 +165,28 @@ final class DepthDriver: ObservableObject {
     private var loopBreakerDir: ExplorationState.Side = .none
     // Close-range reverse confirmation counter (v6)
     private var blockedNearFrames: Int = 0
+    // Static-stuck temporal state (v9)
+    private var prevMotionDepth: [UInt8]? = nil
+    private var prevMotionRoiH: Int = 0
+    private var prevMotionRoiW: Int = 0
+    private var staticStuckFrames: Int = 0
+    private var softStuckFrames: Int = 0
+    // v11: soft-reverse hold + post-reverse grace + transition tracker
+    private var softReverseHoldCount: Int = 0
+    private var postReverseSoftGrace: Int = 0
+    private var wasReversing: Bool = false
+    // PID steering state (v9)
+    private var steerPid = SteerPID()
+    private var lastPidTime: CFTimeInterval = CACurrentMediaTime()
+    // Coverage / doorway state (explore.py)
+    private var prevZoneSignature: [Float]? = nil
+    private var coveragePlateauFrames: Int = 0
+    private var coverageSweepFrames: Int = 0
+    private var coverageSweepCooldown: Int = 0
+    private var coverageSweepDirLeft: Bool = true
+    private var coverageToggleLeft: Bool = true
+    private var doorwayCommitFrames: Int = 0
+    private var doorwayCommitCmd: DrivingCommand = .forward
 
     // Model
     nonisolated(unsafe) private var model: MLModel?
@@ -192,6 +258,22 @@ final class DepthDriver: ObservableObject {
         loopBreakerFrames = 0
         loopBreakerDir = .none
         blockedNearFrames = 0
+        prevMotionDepth = nil
+        staticStuckFrames = 0
+        softStuckFrames = 0
+        softReverseHoldCount = 0
+        postReverseSoftGrace = 0
+        wasReversing = false
+        steerPid.reset()
+        lastPidTime = CACurrentMediaTime()
+        prevZoneSignature = nil
+        coveragePlateauFrames = 0
+        coverageSweepFrames = 0
+        coverageSweepCooldown = 0
+        coverageSweepDirLeft = true
+        coverageToggleLeft = true
+        doorwayCommitFrames = 0
+        doorwayCommitCmd = .forward
         DepthDriver.diagLogged = false
         inFlight.withLock { $0 = false }
     }
@@ -312,35 +394,210 @@ final class DepthDriver: ObservableObject {
         farZones  = fz
         nearZones = nz
 
-        // ── Pre-decide must-reverse gate (v6) ────────────────────────────
-        // Operates on car-space (mirrored) NEAR scores to be consistent with decision tree.
+        // ── Static-stuck: temporal change in depth ROI (v9) ──────────────
+        let roiW = w
+        let roiStart = safeRow0
+        let roiH = h - roiStart
+        var meanMotionDiff: Float = 255.0
+        if let prev = prevMotionDepth, prevMotionRoiW == roiW, prevMotionRoiH == roiH {
+            var sum: UInt64 = 0
+            var count: UInt64 = 0
+            for y in 0..<roiH {
+                let curBase  = (roiStart + y) * w
+                let prevBase = y * roiW
+                for x in 0..<roiW {
+                    let a = Int(depthU8[curBase + x])
+                    let b = Int(prev[prevBase + x])
+                    sum &+= UInt64(abs(a - b))
+                    count &+= 1
+                }
+            }
+            meanMotionDiff = count > 0 ? Float(sum) / Float(count) : 255
+            // v11: increment moved below — gated on center not wide-open.
+        }
+        // Snapshot ROI for next frame (only the navigation portion).
+        var roiSnap = [UInt8](repeating: 0, count: roiW * roiH)
+        for y in 0..<roiH {
+            let src = (roiStart + y) * w
+            let dst = y * roiW
+            for x in 0..<roiW { roiSnap[dst + x] = depthU8[src + x] }
+        }
+        prevMotionDepth = roiSnap
+        prevMotionRoiW = roiW
+        prevMotionRoiH = roiH
+
+        // ── Pre-decide must-reverse gate (v6 + v9 static-stuck) ─────────
         let nearScoresCar = nz.map(\.obstacleScore).reversed() as [Float]
+        let farScoresCar  = fz.map(\.obstacleScore).reversed() as [Float]
         let nc3Min = min(nearScoresCar[2], min(nearScoresCar[3], nearScoresCar[4]))
         let nc3Avg = (nearScoresCar[2] + nearScoresCar[3] + nearScoresCar[4]) / 3
         let blockedCount = nearScoresCar.filter { $0 < reverseBlockedCenterThreshold }.count
+
+        // ── Coverage plateau detector (explore.py) ──────────────────────
+        var signature = [Float](); signature.reserveCapacity(14)
+        signature.append(contentsOf: farScoresCar)
+        signature.append(contentsOf: nearScoresCar)
+        let signatureDiff: Float
+        if let prev = prevZoneSignature, prev.count == signature.count {
+            var sum: Float = 0
+            for i in 0..<signature.count { sum += abs(signature[i] - prev[i]) }
+            signatureDiff = sum / Float(signature.count)
+        } else {
+            signatureDiff = 255.0
+        }
+        prevZoneSignature = signature
 
         let blockedScene = (nc3Min < reverseBlockedCenterThreshold)
                            && (blockedCount >= reverseBlockedMinNearZones)
         if blockedScene { blockedNearFrames += 1 }
         else            { blockedNearFrames = 0 }
 
-        let mustReverseNow = (nc3Avg < reverseImmediateCenterThreshold)
-                             || (blockedNearFrames >= reverseBlockedConfirmFrames)
+        // Soft-stuck (v10): center weak AND both sides weak for several frames.
+        let nearLeftAvg  = (nearScoresCar[0] + nearScoresCar[1] + nearScoresCar[2]) / 3
+        let nearRightAvg = (nearScoresCar[4] + nearScoresCar[5] + nearScoresCar[6]) / 3
 
-        let raw: DrivingCommand
+        // Coverage plateau bookkeeping (explore.py)
+        let openRoomScene = (nc3Avg > coverageOpenCenterThreshold)
+                            && (nearLeftAvg  > coverageOpenSideThreshold)
+                            && (nearRightAvg > coverageOpenSideThreshold)
+        if coverageModeEnabled && openRoomScene && signatureDiff < coveragePlateauDiffThreshold {
+            coveragePlateauFrames += 1
+        } else {
+            coveragePlateauFrames = 0
+        }
+        if coverageSweepCooldown > 0 { coverageSweepCooldown -= 1 }
+        let softStuckScene = softStuckEnabled
+            && (nc3Avg < softStuckCenterThreshold)
+            && (max(nearLeftAvg, nearRightAvg) < softStuckSideThreshold)
+        if softStuckScene { softStuckFrames += 1 }
+        else              { softStuckFrames = 0 }
+        let softStuckConfirmed = softStuckFrames >= softStuckConfirmFrames
+
+        // v11: static-stuck gated on center not being wide-open.
+        let staticStuckScene = (meanMotionDiff < staticStuckDiffThreshold)
+                                && (nc3Avg < staticStuckCenterMax)
+        if staticStuckScene { staticStuckFrames += 1 }
+        else                 { staticStuckFrames = 0 }
+        let staticStuckConfirmed = staticStuckFrames >= staticStuckConfirmFrames
+
+        // v11: split must-reverse into hard (immediate close-range) and soft (temporal/static).
+        let hardReverseNow = (nc3Avg < reverseImmediateCenterThreshold)
+                              || (blockedNearFrames >= reverseBlockedConfirmFrames)
+        var softReverseNow = staticStuckConfirmed
+                              || softStuckConfirmed
+                              || softReverseHoldCount > 0
+
+        // Decrement hold counter (kept temporary, not sticky).
+        if softReverseHoldCount > 0 { softReverseHoldCount -= 1 }
+        // Post-reverse grace: suppress soft re-trigger briefly so we can drive out.
+        if postReverseSoftGrace > 0 {
+            postReverseSoftGrace -= 1
+            softReverseNow = false
+        }
+        // If already reversing and hard isn't required, soft signals don't extend reverse.
+        if !hardReverseNow && (lastCommand == .reverse || lastCommand == .reverseLeft || lastCommand == .reverseRight) {
+            softReverseNow = false
+        }
+
+        let mustReverseNow = hardReverseNow || softReverseNow
+
+        // ── PID steering bonuses (v9) — computed in car-space ───────────
+        var pidLeftBonus: Float = 0
+        var pidRightBonus: Float = 0
+        if pidEnabled && !mustReverseNow {
+            let farScoresCar = fz.map(\.obstacleScore).reversed() as [Float]
+            let nL = (nearScoresCar[0] + nearScoresCar[1] + nearScoresCar[2]) / 3
+            let nR = (nearScoresCar[4] + nearScoresCar[5] + nearScoresCar[6]) / 3
+            let fL = (farScoresCar[0]  + farScoresCar[1]  + farScoresCar[2])  / 3
+            let fR = (farScoresCar[4]  + farScoresCar[5]  + farScoresCar[6])  / 3
+            // NEAR weighted higher to reduce obstacle-side wobble.
+            let leftMetric  = 0.7 * nL + 0.3 * fL
+            let rightMetric = 0.7 * nR + 0.3 * fR
+            let err = rightMetric - leftMetric   // +ve → right more open
+
+            let now = CACurrentMediaTime()
+            let dt = now - lastPidTime
+            lastPidTime = now
+
+            var out = steerPid.update(error: err, dt: dt)
+            if abs(out) < pidDeadband { out = 0 }
+            if out >= 0 { pidRightBonus = out * pidBonusScale }
+            else        { pidLeftBonus  = -out * pidBonusScale }
+        }
+
+        if mustReverseNow {
+            coverageSweepFrames = 0
+            coveragePlateauFrames = 0
+            doorwayCommitFrames = 0
+        }
+
+        var raw: DrivingCommand
         if mustReverseNow {
             consecutiveReverse += 1
-            if consecutiveReverse > reverseEscapeFrames {
-                let lAvg = (nearScoresCar[0] + nearScoresCar[1] + nearScoresCar[2]) / 3
-                let rAvg = (nearScoresCar[4] + nearScoresCar[5] + nearScoresCar[6]) / 3
-                raw = (lAvg >= rAvg) ? .reverseLeft : .reverseRight
+            steerPid.reset()
+            if hardReverseNow && consecutiveReverse > reverseEscapeFrames {
+                raw = (nearLeftAvg >= nearRightAvg) ? .reverseLeft : .reverseRight
+            } else if softReverseNow {
+                // Set hold on transition into soft reverse (so we don't flicker out next frame).
+                let prevWasReverse = (lastCommand == .reverse || lastCommand == .reverseLeft || lastCommand == .reverseRight)
+                if !prevWasReverse {
+                    softReverseHoldCount = max(0, softReverseHoldFrames - 1)
+                }
+                if      nearLeftAvg  > nearRightAvg + softStuckTurnMargin { raw = .reverseLeft  }
+                else if nearRightAvg > nearLeftAvg  + softStuckTurnMargin { raw = .reverseRight }
+                else                                                       { raw = .reverse      }
             } else {
                 raw = .reverse
             }
             escapePhase = 0
         } else {
-            raw = decideCommand(farZones: fz, nearZones: nz)
+            raw = decideCommand(farZones: fz, nearZones: nz,
+                                pidLeftBonus: pidLeftBonus, pidRightBonus: pidRightBonus)
         }
+
+        // ── Doorway commit override (explore.py) ────────────────────────
+        var doorwayCommitActive = false
+        if doorwayCommitEnabled && !mustReverseNow {
+            if doorwayCommitFrames > 0 {
+                doorwayCommitFrames -= 1
+                if nc3Avg >= doorwayCommitCancelCenter {
+                    raw = doorwayCommitCmd
+                    doorwayCommitActive = true
+                    steerPid.reset()
+                } else {
+                    doorwayCommitFrames = 0
+                }
+            } else if nc3Avg >= doorwayCommitMinNearCenter && coverageSweepFrames == 0 {
+                if let doorCmd = findFarDoorwayCmd(farScoresCar: farScoresCar) {
+                    doorwayCommitCmd = doorCmd
+                    doorwayCommitFrames = max(0, doorwayCommitFramesCount - 1)
+                    coveragePlateauFrames = 0
+                    raw = doorCmd
+                    doorwayCommitActive = true
+                    steerPid.reset()
+                }
+            }
+        }
+
+        // ── Coverage sweep override (explore.py) ────────────────────────
+        if coverageModeEnabled && !mustReverseNow && !doorwayCommitActive {
+            if coverageSweepFrames == 0
+                && coverageSweepCooldown == 0
+                && coveragePlateauFrames >= coveragePlateauConfirmFrames
+            {
+                coverageSweepDirLeft = coverageToggleLeft
+                coverageToggleLeft = !coverageToggleLeft
+                coverageSweepFrames = coverageSweepFramesCount
+                coverageSweepCooldown = coverageSweepCooldownFrames
+                coveragePlateauFrames = 0
+            }
+            if coverageSweepFrames > 0 {
+                coverageSweepFrames -= 1
+                steerPid.reset()
+                raw = coverageSweepDirLeft ? .forwardLeft : .forwardRight
+            }
+        }
+
         var smoothed = push(raw)
 
         // Loop breaker: track reverses; force a sustained turn when looping.
@@ -362,12 +619,25 @@ final class DepthDriver: ObservableObject {
                 loopBreakerDir = (rights >= lefts) ? .left : .right
                 loopBreakerFrames = loopBreakerFramesMax
                 reverseHistory.removeAll()
+                steerPid.reset()
             }
         }
         if loopBreakerEnabled && loopBreakerFrames > 0 && !mustReverseNow {
             loopBreakerFrames -= 1
             smoothed = (loopBreakerDir == .left) ? .forwardLeft : .forwardRight
         }
+
+        // v11: reverse → non-reverse transition starts grace window so we can
+        // actually drive out instead of re-triggering soft/static reverse.
+        let smoothedIsRev = (smoothed == .reverse || smoothed == .reverseLeft || smoothed == .reverseRight)
+        if wasReversing && !smoothedIsRev {
+            postReverseSoftGrace = postReverseSoftGraceFrames
+            staticStuckFrames    = 0
+            softStuckFrames      = 0
+            softReverseHoldCount = 0
+            consecutiveReverse   = 0
+        }
+        wasReversing = smoothedIsRev
 
         lastCommand = smoothed
         exploration.recordCommand(smoothed)
@@ -435,6 +705,38 @@ final class DepthDriver: ObservableObject {
         return out
     }
 
+    // Far-row doorway helper (explore.py)
+    @MainActor
+    private func findFarDoorwayCmd(farScoresCar: [Float]) -> DrivingCommand? {
+        var gaps: [(center: Float, width: Int, avg: Float)] = []
+        var gapStart: Int? = nil
+        var gapSum: Float = 0
+        for (i, score) in farScoresCar.enumerated() {
+            if score >= doorwayCommitMinFarScore {
+                if gapStart == nil { gapStart = i; gapSum = score }
+                else               { gapSum += score }
+            } else if let start = gapStart {
+                let width = i - start
+                gaps.append((Float(start) + Float(width) / 2.0, width, gapSum / Float(width)))
+                gapStart = nil; gapSum = 0
+            }
+        }
+        if let start = gapStart {
+            let width = farScoresCar.count - start
+            gaps.append((Float(start) + Float(width) / 2.0, width, gapSum / Float(width)))
+        }
+        let doorway = gaps.filter { $0.width >= 1 && $0.width <= doorwayCommitMaxWidth }
+        guard !doorway.isEmpty else { return nil }
+        // Prefer clearer doorway; tie-break toward central openings.
+        let best = doorway.max { a, b in
+            if a.avg != b.avg { return a.avg < b.avg }
+            return abs(a.center - 3.0) > abs(b.center - 3.0)
+        }!
+        if best.center < doorwayCommitLeftEdge  { return .forwardLeft  }
+        if best.center > doorwayCommitRightEdge { return .forwardRight }
+        return .forward
+    }
+
     // Gap helper
     private struct Gap { let center: Float; let width: Int; let avg: Float }
 
@@ -484,7 +786,8 @@ final class DepthDriver: ObservableObject {
     }
 
     @MainActor
-    private func decideCommand(farZones: [ZoneScore], nearZones: [ZoneScore]) -> DrivingCommand {
+    private func decideCommand(farZones: [ZoneScore], nearZones: [ZoneScore],
+                               pidLeftBonus: Float = 0, pidRightBonus: Float = 0) -> DrivingCommand {
         // Mirror horizontally — depth image left/right is opposite to car steering left/right.
         let farScores  = farZones.map(\.obstacleScore).reversed() as [Float]
         let nearScores = nearZones.map(\.obstacleScore).reversed() as [Float]
@@ -538,10 +841,28 @@ final class DepthDriver: ObservableObject {
         if exitAvoidanceEnabled && exitHardBlockEnabled && exploration.outsideTimer > 0 {
             let nL = (nearScores[0] + nearScores[1] + nearScores[2]) / 3
             let nR = (nearScores[4] + nearScores[5] + nearScores[6]) / 3
+            // v9: opposite side must be clearly viable (≥145 avg) AND deficit ≤18.
             switch exploration.outsideSide {
-            case .left  where nR > forwardThreshold: return .forwardRight
-            case .right where nL > forwardThreshold: return .forwardLeft
-            default: break  // both sides blocked — fall through
+            case .left where nR >= exitHardBlockMinOppositeAvg
+                          && (nL - nR) <= exitHardBlockMaxDeficit:
+                return .forwardRight
+            case .right where nL >= exitHardBlockMinOppositeAvg
+                           && (nR - nL) <= exitHardBlockMaxDeficit:
+                return .forwardLeft
+            default: break
+            }
+        }
+
+        // 2.6. Soft stuck (not faceplanted) → reverse to re-position (v10)
+        if softStuckEnabled {
+            let sL = (nearScores[0] + nearScores[1] + nearScores[2]) / 3 + expL + pidLeftBonus
+            let sR = (nearScores[4] + nearScores[5] + nearScores[6]) / 3 + expR + pidRightBonus
+            let centerAvg = nearCenter3.reduce(0, +) / 3.0
+            if centerAvg < softStuckCenterThreshold && max(sL, sR) < softStuckSideThreshold {
+                consecutiveReverse += 1
+                if      sL > sR + softStuckTurnMargin { return .reverseLeft  }
+                else if sR > sL + softStuckTurnMargin { return .reverseRight }
+                else                                   { return .reverse      }
             }
         }
 
@@ -554,7 +875,8 @@ final class DepthDriver: ObservableObject {
             var rAvg = rScores.reduce(0, +) / 3.0
             if lastCommand == .forwardLeft  { lAvg += hysteresisBonus }
             if lastCommand == .forwardRight { rAvg += hysteresisBonus }
-            lAvg += expL; rAvg += expR
+            lAvg += expL + pidLeftBonus
+            rAvg += expR + pidRightBonus
             let lMax = lScores.max() ?? 0
             let rMax = rScores.max() ?? 0
             if lAvg > rAvg + steerMinDiff { return .forwardLeft  }
@@ -572,8 +894,8 @@ final class DepthDriver: ObservableObject {
                 let fStd = stdev(farScores)
                 let fMean = farScores.reduce(0, +) / Float(farScores.count)
                 if fStd < farVarianceThreshold && fMean > farOpenMeanThreshold {
-                    let nL = (nearScores[0] + nearScores[1] + nearScores[2]) / 3 + expL
-                    let nR = (nearScores[4] + nearScores[5] + nearScores[6]) / 3 + expR
+                    let nL = (nearScores[0] + nearScores[1] + nearScores[2]) / 3 + expL + pidLeftBonus
+                    let nR = (nearScores[4] + nearScores[5] + nearScores[6]) / 3 + expR + pidRightBonus
                     if nL > nR + steerMinDiff { return .forwardLeft  }
                     if nR > nL + steerMinDiff { return .forwardRight }
                 }
@@ -590,8 +912,8 @@ final class DepthDriver: ObservableObject {
                 let nR = (nearScores[4] + nearScores[5] + nearScores[6]) / 3
                 if nL < forwardThreshold && nR < forwardThreshold { return .forward }
             }
-            let flAvg = (farScores[0] + farScores[1] + farScores[2]) / 3 + expL
-            let frAvg = (farScores[4] + farScores[5] + farScores[6]) / 3 + expR
+            let flAvg = (farScores[0] + farScores[1] + farScores[2]) / 3 + expL + pidLeftBonus
+            let frAvg = (farScores[4] + farScores[5] + farScores[6]) / 3 + expR + pidRightBonus
             if flAvg > frAvg + steerMinDiff { return .forwardLeft  }
             if frAvg > flAvg + steerMinDiff { return .forwardRight }
             return .forward
@@ -610,8 +932,8 @@ final class DepthDriver: ObservableObject {
 
         // Gap centered — check if clear enough to go straight
         if nearCenterAvg >= forwardThreshold * 0.8 { return .forward }
-        let lAvg = (nearScores[0] + nearScores[1] + nearScores[2]) / 3 + expL
-        let rAvg = (nearScores[4] + nearScores[5] + nearScores[6]) / 3 + expR
+        let lAvg = (nearScores[0] + nearScores[1] + nearScores[2]) / 3 + expL + pidLeftBonus
+        let rAvg = (nearScores[4] + nearScores[5] + nearScores[6]) / 3 + expR + pidRightBonus
         if lAvg > rAvg + 10 { return .forwardLeft  }
         if rAvg > lAvg + 10 { return .forwardRight }
         return .forward
@@ -882,5 +1204,43 @@ struct ExplorationState {
         if l - r >= turnBalanceThreshold { b += turnBalanceBonus }
         if exitAvoidEnabled && outsideTimer > 0 && outsideSide == .right { b -= exitAvoidancePenalty }
         return b
+    }
+}
+
+// ── SteerPID ──────────────────────────────────────────────────────────────────
+// Continuous left/right correction signal added to score-based decision tree.
+// Smooths rapid oscillation around equal scores (anti-wobble).
+
+struct SteerPID {
+    var kp: Float = 0.35
+    var ki: Float = 0.025
+    var kd: Float = 0.18
+    var integralClamp: Float = 180.0
+    var outputClamp:   Float = 35.0
+    var dtDefault:     Double = 1.0 / 15.0
+
+    private var integral:    Float = 0
+    private var prevError:   Float = 0
+    private var initialized: Bool  = false
+
+    mutating func reset() {
+        integral = 0; prevError = 0; initialized = false
+    }
+
+    mutating func update(error: Float, dt: Double) -> Float {
+        let dtUse = dt <= 1e-6 ? dtDefault : dt
+        integral += error * Float(dtUse)
+        if integral >  integralClamp { integral =  integralClamp }
+        if integral < -integralClamp { integral = -integralClamp }
+
+        let derivative: Float
+        if initialized { derivative = (error - prevError) / Float(dtUse) }
+        else           { derivative = 0; initialized = true }
+        prevError = error
+
+        var out = kp * error + ki * integral + kd * derivative
+        if out >  outputClamp { out =  outputClamp }
+        if out < -outputClamp { out = -outputClamp }
+        return out
     }
 }

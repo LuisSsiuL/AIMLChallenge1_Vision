@@ -1,0 +1,1792 @@
+import os
+import time
+import threading
+from collections import deque
+from enum import Enum
+from dataclasses import dataclass
+
+import cv2
+import numpy as np
+import urllib.request
+from pynput.keyboard import Controller
+
+from depth_anything_v2_coreml import DepthAnythingV2CoreML
+
+# ---------------------------------------------------------------------------
+# ESP32-CAM + Depth Anything V2 CoreML — WASD Navigation
+#
+# Uses CoreML .mlpackage for faster inference on macOS (Apple Silicon / Intel).
+# Same navigation logic as live_depth_wasd.py but with CoreML backend.
+#
+# Requires:  pip install coremltools pynput
+# macOS note: grant Accessibility permission to your Terminal app in
+#             System Preferences > Privacy & Security > Accessibility.
+# ---------------------------------------------------------------------------
+
+# ===========================================================================
+# CONFIGURATION
+# ===========================================================================
+
+# --- Source ---
+CAMERA_SCAN_LIMIT = 6   # probe indices 0..N-1 for local/USB/Continuity cameras
+
+# --- CoreML Model ---
+MODEL_PATH = os.path.join(
+    os.path.dirname(__file__),
+    "models",
+    "DepthAnythingV2SmallF16.mlpackage",
+)
+
+# --- Capture ---
+CAPTURE_WIDTH  = 320
+CAPTURE_HEIGHT = 240
+FRAME_SKIP     = 1
+COLORMAP       = cv2.COLORMAP_INFERNO
+
+# --- Flip ---
+FLIP_HORIZONTAL = False  # True = mirror left-right
+FLIP_VERTICAL   = False  # True = flip upside-down
+
+# --- Navigation ---
+# ObstacleScore displayed on screen: LOW = close/obstacle, HIGH = far/open space
+# Always steer toward the zone with the HIGHEST score (most open space).
+FORWARD_THRESHOLD     = 120    # Center score above this → safe to go straight
+STUCK_THRESHOLD       = 60     # All zones below this → truly stuck, REVERSE
+STEER_MIN_DIFF        = 15     # Min score difference between sides to prefer one over the other
+HYSTERESIS_BONUS      = 10     # Score bonus for continuing current direction
+NAV_ROW_START         = 0.30   # top of ROI as fraction of frame height (ignore sky/background)
+CMD_SMOOTH_FRAMES     = 3      # majority-vote window size (lower = faster reaction)
+REVERSE_ESCAPE_FRAMES = 8      # consecutive stuck frames before triggering escape manoeuvre
+DEBUG_NAVIGATION      = False  # Set to True to print zone scores and decisions
+
+# --- Gamma Correction ---
+NAVIGATION_GAMMA      = 0.8    # Applied to depth values before zone scoring (< 1 = brighten/compress)
+DISPLAY_GAMMA         = 2      # Applied only to display colorization
+
+# Additional reverse safety for close-range blockage.
+# Uses temporal confirmation to avoid single-frame floor/lighting noise.
+REVERSE_BLOCKED_CENTER_THRESHOLD = 70   # near-center score below this is considered blocked
+REVERSE_BLOCKED_MIN_NEAR_ZONES   = 5    # minimum near zones below threshold to count as blocked scene
+REVERSE_BLOCKED_CONFIRM_FRAMES   = 3    # blocked frames required before forcing reverse
+REVERSE_IMMEDIATE_CENTER_THRESHOLD = 40 # immediate reverse when near-center average is critically low
+
+# Additional stuck signal: if depth image barely changes for several frames,
+# we likely hit an obstacle and are not making progress.
+STATIC_STUCK_DIFF_THRESHOLD       = 16.0 # mean abs pixel diff below this counts as "no change"
+STATIC_STUCK_CONFIRM_FRAMES       = 12   # consecutive no-change frames before forcing reverse
+STATIC_STUCK_USE_NAV_ROI          = True # compare only navigation ROI instead of full frame
+STATIC_STUCK_CENTER_MAX           = 145.0 # static signal only counts when center is not wide-open
+
+# Soft stuck (not faceplanted): center and both sides are weak for several
+# frames, so reverse to re-position even before hard-block conditions trigger.
+SOFT_STUCK_ENABLED                = True
+SOFT_STUCK_CENTER_THRESHOLD       = 120.0
+SOFT_STUCK_SIDE_THRESHOLD         = 155.0
+SOFT_STUCK_CONFIRM_FRAMES         = 8
+SOFT_STUCK_TURN_MARGIN            = 8.0
+SOFT_REVERSE_HOLD_FRAMES          = 4    # hold reverse this many frames when soft/static stuck triggers
+POST_REVERSE_SOFT_GRACE_FRAMES    = 10   # ignore soft/static re-trigger briefly after leaving reverse
+
+# Roomba-style coverage sweep:
+# In wide/open rooms where the scene changes very little, force alternating
+# sweep turns to expand camera coverage and discover other exits/doorways.
+COVERAGE_MODE_ENABLED             = True
+COVERAGE_PLATEAU_DIFF_THRESHOLD   = 8.0   # low zone-signature change means repetitive view
+COVERAGE_PLATEAU_CONFIRM_FRAMES   = 18    # repetitive frames before sweep trigger
+COVERAGE_OPEN_CENTER_THRESHOLD    = 145.0 # only trigger in clearly open center
+COVERAGE_OPEN_SIDE_THRESHOLD      = 140.0 # both sides must also be open
+COVERAGE_SWEEP_FRAMES             = 14    # duration of one sweep turn burst
+COVERAGE_SWEEP_COOLDOWN_FRAMES    = 36    # min spacing between sweep bursts
+
+# Doorway commit mode:
+# When a narrow, promising FAR gap is found, hold a short directional command
+# so the car commits through the opening into adjacent spaces.
+DOORWAY_COMMIT_ENABLED            = True
+DOORWAY_COMMIT_MIN_FAR_SCORE      = 135.0
+DOORWAY_COMMIT_MAX_WIDTH          = 3
+DOORWAY_COMMIT_FRAMES             = 10
+DOORWAY_COMMIT_MIN_NEAR_CENTER    = 105.0
+DOORWAY_COMMIT_CANCEL_CENTER      = 90.0
+DOORWAY_COMMIT_LEFT_EDGE          = 2.8
+DOORWAY_COMMIT_RIGHT_EDGE         = 4.2
+
+# --- Exploration / Inward-Bias ---
+# These settings make the car push deeper into a building rather than
+# drifting back toward the (most open) exit.
+EXPLORATION_ENABLED       = True   # Master switch for inward-bias logic
+INWARD_BIAS               = 25     # Score bonus added to the side that keeps the car
+                                    # moving inward (away from where it reversed from).
+                                    # Raise to push harder inward; lower to be more reactive.
+TURN_BALANCE_WINDOW       = 40     # Frames over which left/right turns are counted.
+                                    # After this many frames the car tries to balance turns
+                                    # so it explores both sides instead of wall-hugging.
+TURN_BALANCE_BONUS        = 12     # Bonus given to the under-used turn direction when
+                                    # the imbalance exceeds TURN_BALANCE_THRESHOLD.
+TURN_BALANCE_THRESHOLD    = 6      # Min turn-count difference before balance kicks in.
+REVERSE_HEADING_MEMORY    = 30     # Frames to remember the "came-from" direction after
+                                    # a reverse, so the car avoids going straight back out.
+
+# --- Exit Avoidance (anti-open-space lure) ---
+# Detects when one side consistently looks like "outside" (very open in FAR+NEAR)
+# and temporarily penalizes steering toward that side.
+EXIT_AVOIDANCE_ENABLED     = True   # Master switch for anti-exit behavior
+EXIT_CONFIRM_FRAMES        = 8      # Frames needed to confirm an "outside" side
+EXIT_MEMORY_FRAMES         = 45     # Frames to remember detected outside side
+EXIT_SIDE_DIFF             = 22      # Min openness difference between sides to classify
+EXIT_FAR_OPEN_THRESHOLD    = 165    # FAR-side avg above this counts as very open
+EXIT_NEAR_OPEN_THRESHOLD   = 135    # NEAR-side avg above this supports outside detection
+EXIT_AVOIDANCE_PENALTY     = 30     # Penalty applied to the detected outside side
+EXIT_HARD_BLOCK_ENABLED    = True   # Hard-redirect away from confirmed exit (not just soft penalty)
+
+# --- Corridor Mode ---
+# When near sides are walled (blocked) but center is clear, commit FORWARD
+# instead of second-guessing based on distant FAR obstacles.
+CORRIDOR_MODE_ENABLED      = True   # Master switch
+
+# --- FAR Variance (Indoorness Signal) ---
+# Outside/open areas produce a uniformly high FAR row (low std, high mean).
+# Detecting this lets us prefer a turn over driving straight out.
+FAR_VARIANCE_ENABLED       = True   # Master switch
+FAR_VARIANCE_THRESHOLD     = 15.0   # FAR std below this = homogeneous scene
+FAR_OPEN_MEAN_THRESHOLD    = 150.0  # FAR mean above this + low variance = likely outside
+
+# --- Doorway Bias ---
+# Indoor doorways are narrow gaps (1-4 zones wide). Outside exits are wide (5-7).
+# Boost narrow gaps so the car prefers threading through a doorway over an exit.
+DOORWAY_BIAS_ENABLED       = True   # Master switch
+DOORWAY_MAX_WIDTH          = 4      # Gaps <= this zone-count are considered "doorways"
+DOORWAY_BONUS              = 20     # Score bonus added to doorway-width gaps
+
+# --- Loop Breaker ---
+# If the car reverses repeatedly in a short window it is stuck in a loop.
+# Force a sustained turn toward the less-used side to escape.
+LOOP_BREAKER_ENABLED       = True   # Master switch
+LOOP_REVERSE_WINDOW        = 60     # Rolling frame window for counting reverses
+LOOP_REVERSE_THRESHOLD     = 3      # Reverses in window before loop breaker fires
+LOOP_BREAKER_FRAMES        = 20     # Frames to hold forced turn
+
+# --- PID Steering (anti-wobble) ---
+# PID output is converted into left/right score bonuses used by the
+# existing decision tree. This keeps behavior interpretable while smoothing
+# rapid left-right oscillation around equal scores.
+PID_STEERING_ENABLED       = True
+PID_KP                     = 0.35
+PID_KI                     = 0.025
+PID_KD                     = 0.18
+PID_INTEGRAL_CLAMP         = 180.0
+PID_OUTPUT_CLAMP           = 35.0
+PID_DEADBAND               = 2.0
+PID_BONUS_SCALE            = 1.0
+PID_DT_DEFAULT             = 1.0 / 15.0
+
+# Hard-exit redirect safety guard.
+# Force-away should only happen if the opposite side is clearly viable.
+EXIT_HARD_BLOCK_MIN_OPPOSITE_AVG = 145.0
+EXIT_HARD_BLOCK_MAX_DEFICIT      = 18.0
+
+# ===========================================================================
+# MJPEG stream reader (background thread for ESP32-CAM)
+# ===========================================================================
+class MJPEGCapture:
+    """Non-blocking MJPEG-over-HTTP reader (ESP32-CAM default stream)."""
+
+    def __init__(self, url: str):
+        self.url    = url
+        self._frame = None
+        self._lock  = threading.Lock()
+        self._stop  = threading.Event()
+        t = threading.Thread(target=self._reader, daemon=True)
+        t.start()
+
+    def _reader(self):
+        stream = urllib.request.urlopen(self.url, timeout=10)
+        buf = b""
+        while not self._stop.is_set():
+            buf += stream.read(4096)
+            a  = buf.find(b"\xff\xd8")   # JPEG SOI
+            b_ = buf.find(b"\xff\xd9")   # JPEG EOI
+            if a != -1 and b_ != -1 and b_ > a:
+                jpg = buf[a : b_ + 2]
+                buf = buf[b_ + 2:]
+                img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+                if img is not None:
+                    with self._lock:
+                        self._frame = img
+
+    def read(self):
+        with self._lock:
+            if self._frame is None:
+                return False, None
+            return True, self._frame.copy()
+
+    def release(self):
+        self._stop.set()
+
+
+# ===========================================================================
+# Inference — returns (colorized BGR, depth_u8 grayscale)
+# ===========================================================================
+
+def run_inference(frame_bgr: np.ndarray, model: DepthAnythingV2CoreML):
+    """
+    Run CoreML depth inference on a BGR frame.
+    Returns (colorized_bgr, depth_u8) both resized to original frame dims.
+    """
+    h, w = frame_bgr.shape[:2]
+
+    # Get raw depth from CoreML model
+    depth = model.predict_depth(frame_bgr)  # float32 HxW
+
+    # Normalize to 0-255
+    d_min, d_max = float(depth.min()), float(depth.max())
+    if d_max > d_min:
+        depth_u8 = ((depth - d_min) / (d_max - d_min) * 255.0).astype(np.uint8)
+    else:
+        depth_u8 = np.zeros_like(depth, dtype=np.uint8)
+
+    # Invert: low values = close/obstacle, high values = far/open
+    depth_u8 = 255 - depth_u8
+
+    # Apply gamma correction for navigation (zone scoring)
+    depth_u8_nav = (np.power(depth_u8 / 255.0, NAVIGATION_GAMMA) * 255).astype(np.uint8)
+
+    # Apply gamma for display
+    depth_display = (np.power(depth_u8 / 255.0, DISPLAY_GAMMA) * 255).astype(np.uint8)
+
+    # Colorize
+    colorized = cv2.applyColorMap(depth_display, COLORMAP)
+
+    # Resize to original frame size
+    if colorized.shape[:2] != (h, w):
+        colorized = cv2.resize(colorized, (w, h), interpolation=cv2.INTER_LINEAR)
+        depth_u8_nav = cv2.resize(depth_u8_nav, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    return colorized, depth_u8_nav
+
+
+# ===========================================================================
+# Navigation data types
+# ===========================================================================
+
+class ZoneState(Enum):
+    """Classification of a NavigationZone based on its ObstacleScore."""
+    CLEAR     = "clear"
+    UNCERTAIN = "uncertain"
+    BLOCKED   = "blocked"
+
+
+class DrivingCommand(Enum):
+    """Driving commands mapped to their pynput key characters."""
+    FORWARD         = "w"      # forward only
+    FORWARD_LEFT    = "wa"     # forward + steer left
+    FORWARD_RIGHT   = "wd"     # forward + steer right
+    REVERSE         = "s"      # reverse
+    REVERSE_LEFT    = "sa"     # reverse + steer left
+    REVERSE_RIGHT   = "sd"     # reverse + steer right
+    BRAKE           = ""       # stop
+
+
+@dataclass
+class ZoneInfo:
+    """Per-zone assessment produced by compute_zone_scores each frame."""
+    name:           str
+    mean_depth:     float
+    obstacle_score: float
+    state:          ZoneState
+
+
+# ===========================================================================
+# Navigation logic — zone scoring (2-row 7x7 grid)
+# ===========================================================================
+
+def compute_zone_scores(roi: np.ndarray) -> tuple:
+    """
+    Divide the ROI into 2 horizontal rows, each with 7 columns:
+    - FAR ROW (top 40%): 7 zones — shows path ahead
+    - NEAR ROW (bottom 60%): 7 zones — shows immediate obstacles
+    
+    Returns:
+        (far_zones, near_zones) — two lists of 7 ZoneInfo objects each
+    """
+    h, w = roi.shape
+    
+    # Split into far (top 40%) and near (bottom 60%) rows
+    far_row_end = int(h * 0.4)
+    far_roi = roi[:far_row_end, :]
+    near_roi = roi[far_row_end:, :]
+    
+    # ------------------------------------------------------------------
+    # FAR ROW: 7 zones
+    # ------------------------------------------------------------------
+    far_zones = []
+    far_col_edges = [int(w * i / 7) for i in range(8)]
+    
+    for i in range(7):
+        x0 = far_col_edges[i]
+        x1 = far_col_edges[i + 1]
+        zone_slice = far_roi[:, x0:x1]
+        
+        mean_depth = float(zone_slice.mean())
+        obstacle_score = float(np.clip(mean_depth, 0.0, 255.0))
+        
+        if obstacle_score > FORWARD_THRESHOLD:
+            state = ZoneState.CLEAR
+        elif obstacle_score < STUCK_THRESHOLD:
+            state = ZoneState.BLOCKED
+        else:
+            state = ZoneState.UNCERTAIN
+        
+        far_zones.append(ZoneInfo(
+            name=f"F{i+1}",
+            mean_depth=mean_depth,
+            obstacle_score=obstacle_score,
+            state=state,
+        ))
+    
+    # ------------------------------------------------------------------
+    # NEAR ROW: 7 zones
+    # ------------------------------------------------------------------
+    near_zones = []
+    near_col_edges = [int(w * i / 7) for i in range(8)]
+    
+    for i in range(7):
+        x0 = near_col_edges[i]
+        x1 = near_col_edges[i + 1]
+        zone_slice = near_roi[:, x0:x1]
+        
+        mean_depth = float(zone_slice.mean())
+        obstacle_score = float(np.clip(mean_depth, 0.0, 255.0))
+        
+        if obstacle_score > FORWARD_THRESHOLD:
+            state = ZoneState.CLEAR
+        elif obstacle_score < STUCK_THRESHOLD:
+            state = ZoneState.BLOCKED
+        else:
+            state = ZoneState.UNCERTAIN
+        
+        near_zones.append(ZoneInfo(
+            name=f"N{i+1}",
+            mean_depth=mean_depth,
+            obstacle_score=obstacle_score,
+            state=state,
+        ))
+    
+    return (far_zones, near_zones)
+
+
+# ===========================================================================
+# Navigation logic — decision tree
+# ===========================================================================
+
+def decide_command(
+    far_zones: list,
+    near_zones: list,
+    consecutive_reverse: int,
+    escape_phase: int,
+    last_command: DrivingCommand = None,
+    exploration: "ExplorationState" = None,
+    pid_left_bonus: float = 0.0,
+    pid_right_bonus: float = 0.0,
+) -> tuple:
+    """
+    Navigation with 7x7 grid and STRICT forward requirements.
+    
+    FORWARD only if:
+    - Center 3 zones in NEAR are ALL clear (N3, N4, N5)
+    - Center 3 zones in FAR are ALL clear (F3, F4, F5)
+    - Otherwise, steer toward the best gap
+    
+    When EXPLORATION_ENABLED, an ExplorationState object supplies per-frame
+    left/right bonuses that bias the car inward (away from where it reversed)
+    and balance left/right turns to encourage room-to-room exploration.
+    
+    Returns: (raw_command, new_consecutive_reverse, new_escape_phase)
+    """
+    far_scores = [z.obstacle_score for z in far_zones]
+    near_scores = [z.obstacle_score for z in near_zones]
+
+    # Update exploration state with the latest scene before reading bonuses.
+    if exploration:
+        exploration.observe_scene(far_scores, near_scores)
+
+    # Exploration bonuses (0 if exploration is None or disabled)
+    exp_left  = exploration.left_bonus()  if exploration else 0.0
+    exp_right = exploration.right_bonus() if exploration else 0.0
+
+    if DEBUG_NAVIGATION and exploration and (exp_left or exp_right):
+        print(f"[NAV] Exploration: {exploration.debug_str()}")
+    
+    # Center 3 zones (indices 2, 3, 4)
+    near_center_3 = [near_scores[2], near_scores[3], near_scores[4]]
+    far_center_3 = [far_scores[2], far_scores[3], far_scores[4]]
+    
+    near_center_min = min(near_center_3)
+    near_center_avg = sum(near_center_3) / 3.0
+    far_center_min = min(far_center_3)
+    far_center_avg = sum(far_center_3) / 3.0
+    
+    best_near = max(near_scores)
+    best_far = max(far_scores)
+
+    if DEBUG_NAVIGATION:
+        far_str = " ".join(f"{s:.0f}" for s in far_scores)
+        near_str = " ".join(f"{s:.0f}" for s in near_scores)
+        print(f"[NAV] FAR:  {far_str}")
+        print(f"[NAV] NEAR: {near_str}")
+        print(f"[NAV] near_center_3: min={near_center_min:.0f} avg={near_center_avg:.0f}")
+        print(f"[NAV] far_center_3: min={far_center_min:.0f} avg={far_center_avg:.0f}")
+
+    # ------------------------------------------------------------------
+    # 1. Escape manoeuvre (if active)
+    # ------------------------------------------------------------------
+    if escape_phase != 0:
+        if escape_phase > 0:
+            new_escape_phase = escape_phase - 1
+            if new_escape_phase == 0:
+                new_escape_phase = -5
+            if DEBUG_NAVIGATION:
+                print(f"[NAV] → REVERSE_LEFT (escape {escape_phase})")
+            return (DrivingCommand.REVERSE_LEFT, 0, new_escape_phase)
+        else:
+            new_escape_phase = escape_phase + 1
+            if new_escape_phase == 0:
+                if DEBUG_NAVIGATION:
+                    print(f"[NAV] → FORWARD (escape done)")
+                return (DrivingCommand.FORWARD, 0, 0)
+            if DEBUG_NAVIGATION:
+                print(f"[NAV] → REVERSE_RIGHT (escape {escape_phase})")
+            return (DrivingCommand.REVERSE_RIGHT, 0, new_escape_phase)
+
+    # ------------------------------------------------------------------
+    # 2. Truly stuck (all near zones very low) → REVERSE
+    # ------------------------------------------------------------------
+    if best_near < STUCK_THRESHOLD:
+        new_consecutive = consecutive_reverse + 1
+        if new_consecutive > REVERSE_ESCAPE_FRAMES:
+            left_avg = sum(near_scores[:3]) / 3
+            right_avg = sum(near_scores[4:]) / 3
+            
+            if left_avg >= right_avg:
+                if DEBUG_NAVIGATION:
+                    print(f"[NAV] → REVERSE_LEFT (escape start)")
+                return (DrivingCommand.REVERSE_LEFT, 0, 5)
+            else:
+                if DEBUG_NAVIGATION:
+                    print(f"[NAV] → REVERSE_RIGHT (escape start)")
+                return (DrivingCommand.REVERSE_RIGHT, 0, -5)
+        
+        if DEBUG_NAVIGATION:
+            print(f"[NAV] → REVERSE (stuck: best_near={best_near:.0f}, consecutive={new_consecutive})")
+        return (DrivingCommand.REVERSE, new_consecutive, 0)
+
+    consecutive_reverse = 0
+
+    # ------------------------------------------------------------------
+    # 2.5. Hard exit redirect — turn away from confirmed outside side
+    # ------------------------------------------------------------------
+    # Unlike the soft penalty in ExplorationState, this is a hard rule:
+    # if we know one side is outside AND the opposite side has any viable path,
+    # we MUST steer away regardless of openness scores.
+    if (EXIT_AVOIDANCE_ENABLED and EXIT_HARD_BLOCK_ENABLED
+            and exploration and exploration.outside_timer > 0):
+        _outside = exploration.outside_side
+        _nl = sum(near_scores[:3]) / 3
+        _nr = sum(near_scores[4:]) / 3
+        if (
+            _outside == "left"
+            and _nr >= EXIT_HARD_BLOCK_MIN_OPPOSITE_AVG
+            and (_nl - _nr) <= EXIT_HARD_BLOCK_MAX_DEFICIT
+        ):
+            if DEBUG_NAVIGATION:
+                print(f"[NAV] -> FORWARD_RIGHT (hard exit block: left confirmed outside)")
+            return (DrivingCommand.FORWARD_RIGHT, 0, 0)
+        elif (
+            _outside == "right"
+            and _nl >= EXIT_HARD_BLOCK_MIN_OPPOSITE_AVG
+            and (_nr - _nl) <= EXIT_HARD_BLOCK_MAX_DEFICIT
+        ):
+            if DEBUG_NAVIGATION:
+                print(f"[NAV] -> FORWARD_LEFT (hard exit block: right confirmed outside)")
+            return (DrivingCommand.FORWARD_LEFT, 0, 0)
+        # Opposite side is also blocked — fall through to normal logic
+
+    # ------------------------------------------------------------------
+    # 2.6. Soft stuck (not faceplanted) -> reverse to re-position
+    # ------------------------------------------------------------------
+    soft_left = sum(near_scores[:3]) / 3 + exp_left + pid_left_bonus
+    soft_right = sum(near_scores[4:]) / 3 + exp_right + pid_right_bonus
+    if (SOFT_STUCK_ENABLED
+            and near_center_avg < SOFT_STUCK_CENTER_THRESHOLD
+            and max(soft_left, soft_right) < SOFT_STUCK_SIDE_THRESHOLD):
+        new_consecutive = consecutive_reverse + 1
+        if soft_left > soft_right + SOFT_STUCK_TURN_MARGIN:
+            if DEBUG_NAVIGATION:
+                print(f"[NAV] -> REVERSE_LEFT (soft stuck)")
+            return (DrivingCommand.REVERSE_LEFT, new_consecutive, 0)
+        if soft_right > soft_left + SOFT_STUCK_TURN_MARGIN:
+            if DEBUG_NAVIGATION:
+                print(f"[NAV] -> REVERSE_RIGHT (soft stuck)")
+            return (DrivingCommand.REVERSE_RIGHT, new_consecutive, 0)
+        if DEBUG_NAVIGATION:
+            print(f"[NAV] -> REVERSE (soft stuck)")
+        return (DrivingCommand.REVERSE, new_consecutive, 0)
+
+    # ------------------------------------------------------------------
+    # 3. Check if center is blocked — if so, MUST steer, never go forward
+    # ------------------------------------------------------------------
+    # Center zones: N3, N4, N5 (indices 2, 3, 4)
+    center_is_blocked = any(score < FORWARD_THRESHOLD for score in near_center_3)
+    
+    if center_is_blocked:
+        # Center has obstacle — MUST steer left or right, never forward
+        if DEBUG_NAVIGATION:
+            print(f"[NAV] Center blocked (scores: {near_center_3}), must steer")
+        
+        # Find which side is more open
+        left_scores = near_scores[:3]   # N1, N2, N3
+        right_scores = near_scores[4:]  # N5, N6, N7
+        
+        left_max = max(left_scores)
+        right_max = max(right_scores)
+        left_avg = sum(left_scores) / len(left_scores)
+        right_avg = sum(right_scores) / len(right_scores)
+        
+        # Apply hysteresis
+        if last_command == DrivingCommand.FORWARD_LEFT:
+            left_avg += HYSTERESIS_BONUS
+        elif last_command == DrivingCommand.FORWARD_RIGHT:
+            right_avg += HYSTERESIS_BONUS
+        
+        # Apply exploration bias (inward push + turn balance)
+        left_avg  += exp_left
+        right_avg += exp_right
+
+        # PID steering bias (continuous correction for oscillation/drift)
+        left_avg  += pid_left_bonus
+        right_avg += pid_right_bonus
+        
+        if DEBUG_NAVIGATION:
+            print(f"[NAV] Left: max={left_max:.0f} avg={left_avg:.0f}  Right: max={right_max:.0f} avg={right_avg:.0f}")
+        
+        # Steer toward the more open side
+        if left_avg > right_avg + STEER_MIN_DIFF:
+            if DEBUG_NAVIGATION:
+                print(f"[NAV] → FORWARD_LEFT (center blocked, left more open)")
+            return (DrivingCommand.FORWARD_LEFT, 0, 0)
+        elif right_avg > left_avg + STEER_MIN_DIFF:
+            if DEBUG_NAVIGATION:
+                print(f"[NAV] → FORWARD_RIGHT (center blocked, right more open)")
+            return (DrivingCommand.FORWARD_RIGHT, 0, 0)
+        else:
+            # Both sides similar — pick the one with higher max score
+            if left_max >= right_max:
+                if DEBUG_NAVIGATION:
+                    print(f"[NAV] → FORWARD_LEFT (center blocked, left max higher)")
+                return (DrivingCommand.FORWARD_LEFT, 0, 0)
+            else:
+                if DEBUG_NAVIGATION:
+                    print(f"[NAV] → FORWARD_RIGHT (center blocked, right max higher)")
+                return (DrivingCommand.FORWARD_RIGHT, 0, 0)
+    
+    # ------------------------------------------------------------------
+    # 4. Center is clear — check if FAR is also clear
+    # ------------------------------------------------------------------
+    near_center_all_clear = near_center_min >= FORWARD_THRESHOLD
+    far_center_all_clear = far_center_min >= FORWARD_THRESHOLD
+    
+    if near_center_all_clear and far_center_all_clear:
+        # FAR Variance check: even with a clear path, a uniformly open FAR row
+        # may indicate the car is heading toward an exit or open outdoor area.
+        # In that case prefer a lateral turn to stay indoors.
+        if FAR_VARIANCE_ENABLED:
+            _far_std  = float(np.std(far_scores))
+            _far_mean = float(np.mean(far_scores))
+            if _far_std < FAR_VARIANCE_THRESHOLD and _far_mean > FAR_OPEN_MEAN_THRESHOLD:
+                _nl = sum(near_scores[:3]) / 3 + exp_left
+                _nr = sum(near_scores[4:]) / 3 + exp_right
+                _nl += pid_left_bonus
+                _nr += pid_right_bonus
+                if _nl > _nr + STEER_MIN_DIFF:
+                    if DEBUG_NAVIGATION:
+                        print(f"[NAV] → FORWARD_LEFT (FAR homogeneous σ={_far_std:.1f} μ={_far_mean:.1f}: possible exit)")
+                    return (DrivingCommand.FORWARD_LEFT, 0, 0)
+                elif _nr > _nl + STEER_MIN_DIFF:
+                    if DEBUG_NAVIGATION:
+                        print(f"[NAV] → FORWARD_RIGHT (FAR homogeneous σ={_far_std:.1f} μ={_far_mean:.1f}: possible exit)")
+                    return (DrivingCommand.FORWARD_RIGHT, 0, 0)
+                # Sides similar — fall through to FORWARD
+        if DEBUG_NAVIGATION:
+            print(f"[NAV] → FORWARD (near+far center all clear)")
+        return (DrivingCommand.FORWARD, 0, 0)
+    
+    # Near is clear but far has obstacle — steer preemptively
+    if near_center_all_clear and not far_center_all_clear:
+        # Corridor mode: if both near sides are walled (blocked), the car is in a
+        # corridor. Commit FORWARD rather than steering away from a distant FAR
+        # obstacle — we'll handle it when it enters the NEAR row.
+        if CORRIDOR_MODE_ENABLED:
+            _nl = sum(near_scores[:3]) / 3
+            _nr = sum(near_scores[4:]) / 3
+            if _nl < FORWARD_THRESHOLD and _nr < FORWARD_THRESHOLD:
+                if DEBUG_NAVIGATION:
+                    print(f"[NAV] → FORWARD (corridor mode: sides walled, center clear)")
+                return (DrivingCommand.FORWARD, 0, 0)
+        # Check which side of FAR is more open
+        far_left_avg = sum(far_scores[:3]) / 3 + exp_left
+        far_right_avg = sum(far_scores[4:]) / 3 + exp_right
+        far_left_avg += pid_left_bonus
+        far_right_avg += pid_right_bonus
+        
+        if far_left_avg > far_right_avg + STEER_MIN_DIFF:
+            if DEBUG_NAVIGATION:
+                print(f"[NAV] → FORWARD_LEFT (near clear, far obstacle ahead, left better)")
+            return (DrivingCommand.FORWARD_LEFT, 0, 0)
+        elif far_right_avg > far_left_avg + STEER_MIN_DIFF:
+            if DEBUG_NAVIGATION:
+                print(f"[NAV] → FORWARD_RIGHT (near clear, far obstacle ahead, right better)")
+            return (DrivingCommand.FORWARD_RIGHT, 0, 0)
+        else:
+            # Far is unclear but near is clear — go forward cautiously
+            if DEBUG_NAVIGATION:
+                print(f"[NAV] → FORWARD (near clear, far unclear)")
+            return (DrivingCommand.FORWARD, 0, 0)
+
+    # ------------------------------------------------------------------
+    # 4. Center not fully clear — find best gap and steer
+    # ------------------------------------------------------------------
+    def find_best_gap(scores):
+        """Find widest gap in a score array."""
+        gaps = []
+        gap_start = None
+        gap_sum = 0
+        
+        for i, score in enumerate(scores):
+            if score >= STUCK_THRESHOLD:
+                if gap_start is None:
+                    gap_start = i
+                    gap_sum = score
+                else:
+                    gap_sum += score
+            else:
+                if gap_start is not None:
+                    gap_width = i - gap_start
+                    gap_center = gap_start + gap_width / 2.0
+                    gap_avg = gap_sum / gap_width
+                    gaps.append((gap_center, gap_width, gap_avg))
+                    gap_start = None
+                    gap_sum = 0
+        
+        # Close last gap
+        if gap_start is not None:
+            gap_width = len(scores) - gap_start
+            gap_center = gap_start + gap_width / 2.0
+            gap_avg = gap_sum / gap_width
+            gaps.append((gap_center, gap_width, gap_avg))
+        
+        if not gaps:
+            return None
+
+        if DOORWAY_BIAS_ENABLED:
+            # Prefer narrow gaps (doorways, width 1-DOORWAY_MAX_WIDTH) over wide
+            # ones (exits/corridors to outside). Boost narrow gap avg scores so
+            # a doorway competes with a wider but exit-like opening.
+            def _gap_score(g):
+                _, width, avg = g
+                return avg + (DOORWAY_BONUS if 1 <= width <= DOORWAY_MAX_WIDTH else 0)
+            return max(gaps, key=_gap_score)
+
+        # Default: widest gap, then highest average
+        return max(gaps, key=lambda g: (g[1], g[2]))
+    
+    near_gap = find_best_gap(near_scores)
+    
+    if near_gap is None:
+        if DEBUG_NAVIGATION:
+            print(f"[NAV] → REVERSE (no near gaps)")
+        return (DrivingCommand.REVERSE, 1, 0)
+    
+    gap_center, gap_width, gap_avg = near_gap
+    
+    # Apply hysteresis
+    if last_command == DrivingCommand.FORWARD_LEFT and gap_center < 3.5:
+        gap_center -= 0.3
+    elif last_command == DrivingCommand.FORWARD_RIGHT and gap_center > 3.5:
+        gap_center += 0.3
+    
+    if DEBUG_NAVIGATION:
+        print(f"[NAV] Near gap: center={gap_center:.1f} width={gap_width} avg={gap_avg:.0f}")
+
+    # ------------------------------------------------------------------
+    # 5. Steer toward gap (7 zones: center is 3.0)
+    # ------------------------------------------------------------------
+    # Zone indices: 0 1 2 3 4 5 6
+    # Center is zone 3 (index 3)
+    
+    # Gap is significantly left (< 2.5)
+    if gap_center < 2.5:
+        if DEBUG_NAVIGATION:
+            print(f"[NAV] → FORWARD_LEFT (gap at {gap_center:.1f})")
+        return (DrivingCommand.FORWARD_LEFT, 0, 0)
+    
+    # Gap is significantly right (> 4.5)
+    if gap_center > 4.5:
+        if DEBUG_NAVIGATION:
+            print(f"[NAV] → FORWARD_RIGHT (gap at {gap_center:.1f})")
+        return (DrivingCommand.FORWARD_RIGHT, 0, 0)
+    
+    # Gap is slightly left (2.5 - 3.0)
+    if gap_center < 3.0:
+        if DEBUG_NAVIGATION:
+            print(f"[NAV] → FORWARD_LEFT (gap slightly left at {gap_center:.1f})")
+        return (DrivingCommand.FORWARD_LEFT, 0, 0)
+    
+    # Gap is slightly right (4.0 - 4.5)
+    if gap_center > 4.0:
+        if DEBUG_NAVIGATION:
+            print(f"[NAV] → FORWARD_RIGHT (gap slightly right at {gap_center:.1f})")
+        return (DrivingCommand.FORWARD_RIGHT, 0, 0)
+    
+    # Gap is centered (3.0 - 4.0) but center zones not all clear
+    # This means there's a narrow path — be cautious
+    if near_center_avg >= FORWARD_THRESHOLD * 0.8:
+        # Center is mostly clear, go forward
+        if DEBUG_NAVIGATION:
+            print(f"[NAV] → FORWARD (gap centered, mostly clear: avg={near_center_avg:.0f})")
+        return (DrivingCommand.FORWARD, 0, 0)
+    else:
+        # Center has some obstacles, steer toward the better side
+        left_avg = sum(near_scores[:3]) / 3 + exp_left
+        right_avg = sum(near_scores[4:]) / 3 + exp_right
+        left_avg += pid_left_bonus
+        right_avg += pid_right_bonus
+        
+        if left_avg > right_avg + 10:
+            if DEBUG_NAVIGATION:
+                print(f"[NAV] → FORWARD_LEFT (center unclear, left better: {left_avg:.0f} vs {right_avg:.0f})")
+            return (DrivingCommand.FORWARD_LEFT, 0, 0)
+        elif right_avg > left_avg + 10:
+            if DEBUG_NAVIGATION:
+                print(f"[NAV] → FORWARD_RIGHT (center unclear, right better: {right_avg:.0f} vs {left_avg:.0f})")
+            return (DrivingCommand.FORWARD_RIGHT, 0, 0)
+        else:
+            if DEBUG_NAVIGATION:
+                print(f"[NAV] → FORWARD (gap centered at {gap_center:.1f}, sides similar)")
+            return (DrivingCommand.FORWARD, 0, 0)
+
+
+# ===========================================================================
+# Command smoothing
+# ===========================================================================
+
+class SteerPID:
+    """Small PID helper for left/right steering bias."""
+
+    def __init__(self, kp: float, ki: float, kd: float):
+        self.kp = float(kp)
+        self.ki = float(ki)
+        self.kd = float(kd)
+        self._integral = 0.0
+        self._prev_error = 0.0
+        self._initialized = False
+
+    def reset(self) -> None:
+        self._integral = 0.0
+        self._prev_error = 0.0
+        self._initialized = False
+
+    def update(self, error: float, dt: float) -> float:
+        if dt <= 1e-6:
+            dt = PID_DT_DEFAULT
+
+        self._integral += error * dt
+        self._integral = float(np.clip(self._integral, -PID_INTEGRAL_CLAMP, PID_INTEGRAL_CLAMP))
+
+        if self._initialized:
+            derivative = (error - self._prev_error) / dt
+        else:
+            derivative = 0.0
+            self._initialized = True
+
+        self._prev_error = error
+
+        output = self.kp * error + self.ki * self._integral + self.kd * derivative
+        return float(np.clip(output, -PID_OUTPUT_CLAMP, PID_OUTPUT_CLAMP))
+
+class Smoother:
+    """Sliding-window majority-vote smoother for DrivingCommands."""
+
+    def __init__(self, window: int):
+        self._buf: deque = deque(maxlen=window)
+
+    def push(self, cmd: DrivingCommand) -> DrivingCommand:
+        """Add raw command to the window and return the smoothed command."""
+        # Reverse commands should take effect immediately when we're boxed in.
+        if cmd in (
+            DrivingCommand.REVERSE,
+            DrivingCommand.REVERSE_LEFT,
+            DrivingCommand.REVERSE_RIGHT,
+        ):
+            self._buf.clear()
+            self._buf.append(cmd)
+            return cmd
+
+        self._buf.append(cmd)
+
+        if len(self._buf) < self._buf.maxlen:
+            return cmd
+
+        brake_count = sum(1 for c in self._buf if c == DrivingCommand.BRAKE)
+        if brake_count > len(self._buf) / 3:
+            return DrivingCommand.BRAKE
+
+        counts: dict = {}
+        for c in self._buf:
+            counts[c] = counts.get(c, 0) + 1
+
+        max_count = max(counts.values())
+        tied = {c for c, n in counts.items() if n == max_count}
+
+        for c in reversed(self._buf):
+            if c in tied:
+                return c
+
+        return cmd
+
+
+class KeyController:
+    """Translates a DrivingCommand into held WASD keypresses via pynput."""
+
+    def __init__(self):
+        self._last: DrivingCommand = DrivingCommand.BRAKE
+        self._kb: Controller = Controller()
+        self._pressed_keys: set = set()  # Track currently pressed keys
+
+    def send(self, cmd: DrivingCommand) -> None:
+        """Release old keys and press new keys for the command."""
+        if cmd == self._last:
+            return
+
+        # Release all currently pressed keys
+        for key in self._pressed_keys:
+            self._kb.release(key)
+        self._pressed_keys.clear()
+
+        # Press new keys based on command
+        keys_to_press = []
+        if cmd == DrivingCommand.FORWARD:
+            keys_to_press = ['w']
+        elif cmd == DrivingCommand.FORWARD_LEFT:
+            keys_to_press = ['w', 'a']
+        elif cmd == DrivingCommand.FORWARD_RIGHT:
+            keys_to_press = ['w', 'd']
+        elif cmd == DrivingCommand.REVERSE:
+            keys_to_press = ['s']
+        elif cmd == DrivingCommand.REVERSE_LEFT:
+            keys_to_press = ['s', 'a']
+        elif cmd == DrivingCommand.REVERSE_RIGHT:
+            keys_to_press = ['s', 'd']
+        # BRAKE = no keys
+
+        for key in keys_to_press:
+            self._kb.press(key)
+            self._pressed_keys.add(key)
+
+        self._last = cmd
+
+    def release_all(self) -> None:
+        """Release any currently held keys and reset state to BRAKE."""
+        for key in self._pressed_keys:
+            self._kb.release(key)
+        self._pressed_keys.clear()
+        self._last = DrivingCommand.BRAKE
+
+
+# ===========================================================================
+# Navigator
+# ===========================================================================
+
+class ExplorationState:
+    """
+    Tracks inward-bias state so the car explores deeper into a building
+    rather than drifting back toward the (most open) exit.
+
+    Strategy
+    --------
+    * After a reverse we remember which side was "behind" us (came_from_side).
+      For REVERSE_HEADING_MEMORY frames we add INWARD_BIAS to the *opposite*
+      side so the car steers away from where it just backed out of.
+    * We count left vs right turns over a rolling TURN_BALANCE_WINDOW.
+      When one side is used much more than the other we add TURN_BALANCE_BONUS
+      to the under-used side, nudging the car to explore both directions
+      instead of wall-hugging.
+    """
+
+    def __init__(self):
+        self.came_from_side: str = "none"       # "left" | "right" | "none"
+        self.came_from_timer: int = 0           # frames remaining for inward bias
+        self._turn_history: deque = deque(maxlen=TURN_BALANCE_WINDOW)
+        self.outside_side: str = "none"        # "left" | "right" | "none"
+        self.outside_timer: int = 0             # frames remaining for anti-exit penalty
+        self._outside_confirm_left: int = 0
+        self._outside_confirm_right: int = 0
+
+    def observe_scene(self, far_scores: list[float], near_scores: list[float]) -> None:
+        """Update outside-side memory from current FAR/NEAR side openness."""
+        if not EXIT_AVOIDANCE_ENABLED:
+            return
+
+        far_left = sum(far_scores[:3]) / 3.0
+        far_right = sum(far_scores[4:]) / 3.0
+        near_left = sum(near_scores[:3]) / 3.0
+        near_right = sum(near_scores[4:]) / 3.0
+
+        left_open = (far_left + near_left) / 2.0
+        right_open = (far_right + near_right) / 2.0
+
+        left_looks_outside = (
+            (left_open > right_open + EXIT_SIDE_DIFF)
+            and far_left >= EXIT_FAR_OPEN_THRESHOLD
+            and near_left >= EXIT_NEAR_OPEN_THRESHOLD
+        )
+        right_looks_outside = (
+            (right_open > left_open + EXIT_SIDE_DIFF)
+            and far_right >= EXIT_FAR_OPEN_THRESHOLD
+            and near_right >= EXIT_NEAR_OPEN_THRESHOLD
+        )
+
+        if left_looks_outside:
+            self._outside_confirm_left = min(self._outside_confirm_left + 1, EXIT_CONFIRM_FRAMES)
+            self._outside_confirm_right = max(self._outside_confirm_right - 1, 0)
+        elif right_looks_outside:
+            self._outside_confirm_right = min(self._outside_confirm_right + 1, EXIT_CONFIRM_FRAMES)
+            self._outside_confirm_left = max(self._outside_confirm_left - 1, 0)
+        else:
+            self._outside_confirm_left = max(self._outside_confirm_left - 1, 0)
+            self._outside_confirm_right = max(self._outside_confirm_right - 1, 0)
+
+        if self._outside_confirm_left >= EXIT_CONFIRM_FRAMES:
+            self.outside_side = "left"
+            self.outside_timer = EXIT_MEMORY_FRAMES
+            self._outside_confirm_left = 0
+        elif self._outside_confirm_right >= EXIT_CONFIRM_FRAMES:
+            self.outside_side = "right"
+            self.outside_timer = EXIT_MEMORY_FRAMES
+            self._outside_confirm_right = 0
+        elif self.outside_timer > 0:
+            self.outside_timer -= 1
+            if self.outside_timer == 0:
+                self.outside_side = "none"
+
+    def record_command(self, cmd: DrivingCommand) -> None:
+        """Call once per frame with the smoothed command."""
+        if cmd in (DrivingCommand.REVERSE_LEFT, DrivingCommand.REVERSE_RIGHT,
+                   DrivingCommand.REVERSE):
+            # Remember which side we were facing when we reversed.
+            # We'll bias away from that side once we go forward again.
+            if cmd == DrivingCommand.REVERSE_LEFT:
+                self.came_from_side = "left"
+            elif cmd == DrivingCommand.REVERSE_RIGHT:
+                self.came_from_side = "right"
+            else:
+                # Plain reverse — keep whatever side we had, or default to none
+                pass
+            self.came_from_timer = REVERSE_HEADING_MEMORY
+
+        elif cmd in (DrivingCommand.FORWARD, DrivingCommand.FORWARD_LEFT,
+                     DrivingCommand.FORWARD_RIGHT):
+            if self.came_from_timer > 0:
+                self.came_from_timer -= 1
+
+            if cmd == DrivingCommand.FORWARD_LEFT:
+                self._turn_history.append("left")
+            elif cmd == DrivingCommand.FORWARD_RIGHT:
+                self._turn_history.append("right")
+            else:
+                self._turn_history.append("fwd")
+
+    def left_bonus(self) -> float:
+        """Extra score to add to the left side when choosing a direction."""
+        if not EXPLORATION_ENABLED:
+            return 0.0
+        bonus = 0.0
+
+        # Inward bias: if we reversed from the right, push left (inward)
+        if self.came_from_timer > 0 and self.came_from_side == "right":
+            bonus += INWARD_BIAS
+
+        # Turn balance: if we've been turning right too much, nudge left
+        lefts  = self._turn_history.count("left")
+        rights = self._turn_history.count("right")
+        if rights - lefts >= TURN_BALANCE_THRESHOLD:
+            bonus += TURN_BALANCE_BONUS
+
+        # Anti-exit: penalize side that has been identified as "outside".
+        if EXIT_AVOIDANCE_ENABLED and self.outside_timer > 0 and self.outside_side == "left":
+            bonus -= EXIT_AVOIDANCE_PENALTY
+
+        return bonus
+
+    def right_bonus(self) -> float:
+        """Extra score to add to the right side when choosing a direction."""
+        if not EXPLORATION_ENABLED:
+            return 0.0
+        bonus = 0.0
+
+        # Inward bias: if we reversed from the left, push right (inward)
+        if self.came_from_timer > 0 and self.came_from_side == "left":
+            bonus += INWARD_BIAS
+
+        # Turn balance: if we've been turning left too much, nudge right
+        lefts  = self._turn_history.count("left")
+        rights = self._turn_history.count("right")
+        if lefts - rights >= TURN_BALANCE_THRESHOLD:
+            bonus += TURN_BALANCE_BONUS
+
+        # Anti-exit: penalize side that has been identified as "outside".
+        if EXIT_AVOIDANCE_ENABLED and self.outside_timer > 0 and self.outside_side == "right":
+            bonus -= EXIT_AVOIDANCE_PENALTY
+
+        return bonus
+
+    def debug_str(self) -> str:
+        lefts  = self._turn_history.count("left")
+        rights = self._turn_history.count("right")
+        return (f"came_from={self.came_from_side}(t={self.came_from_timer}) "
+                f"outside={self.outside_side}(t={self.outside_timer}) "
+                f"turns L={lefts} R={rights} "
+                f"Lbonus={self.left_bonus():.0f} Rbonus={self.right_bonus():.0f}")
+
+
+class Navigator:
+    """Stateful wrapper around the navigation pipeline."""
+
+    def __init__(self):
+        self._smoother: Smoother = Smoother(CMD_SMOOTH_FRAMES)
+        self._steer_pid: SteerPID = SteerPID(PID_KP, PID_KI, PID_KD)
+        self._last_pid_time: float = time.perf_counter()
+        self._consecutive_reverse: int = 0
+        self._escape_phase: int = 0
+        self._last_command: DrivingCommand = DrivingCommand.BRAKE
+        self._exploration: ExplorationState = ExplorationState()
+        self._blocked_near_frames: int = 0
+        self._prev_motion_depth: np.ndarray | None = None
+        self._static_stuck_frames: int = 0
+        self._soft_stuck_frames: int = 0
+        self._soft_reverse_hold_frames: int = 0
+        self._post_reverse_soft_grace: int = 0
+        self._was_reversing: bool = False
+        self._prev_zone_signature: np.ndarray | None = None
+        self._coverage_plateau_frames: int = 0
+        self._coverage_sweep_frames: int = 0
+        self._coverage_sweep_cooldown: int = 0
+        self._coverage_sweep_dir: str = "left"
+        self._coverage_toggle_left: bool = True
+        self._doorway_commit_frames: int = 0
+        self._doorway_commit_cmd: DrivingCommand = DrivingCommand.FORWARD
+        # Loop breaker state
+        self._reverse_history: deque = deque(maxlen=LOOP_REVERSE_WINDOW)
+        self._loop_breaker_frames: int = 0
+        self._loop_breaker_dir: str = "none"
+
+    def process_frame(self, depth_u8: np.ndarray) -> tuple:
+        """
+        Run the full navigation pipeline on a single depth frame.
+        
+        Returns:
+            (raw_command, smoothed_command, far_zones, near_zones)
+        """
+        # Degenerate depth map guard
+        if float(depth_u8.std()) < 1e-3:
+            print(f"[NAV][WARN] Degenerate depth map detected; emitting BRAKE")
+            smoothed = self._smoother.push(DrivingCommand.BRAKE)
+            placeholder_far = [
+                ZoneInfo(name=f"F{i+1}", mean_depth=0.0, obstacle_score=0.0, state=ZoneState.UNCERTAIN)
+                for i in range(7)
+            ]
+            placeholder_near = [
+                ZoneInfo(name=f"N{i+1}", mean_depth=0.0, obstacle_score=0.0, state=ZoneState.UNCERTAIN)
+                for i in range(7)
+            ]
+            return (DrivingCommand.BRAKE, smoothed, placeholder_far, placeholder_near)
+
+        # Extract ROI
+        h, w = depth_u8.shape
+        roi_row0 = int(h * NAV_ROW_START)
+        roi = depth_u8[roi_row0:, :]
+
+        # ------------------------------------------------------------------
+        # Motion/stuck signal from temporal depth change
+        # ------------------------------------------------------------------
+        motion_view = roi if STATIC_STUCK_USE_NAV_ROI else depth_u8
+        if self._prev_motion_depth is not None and self._prev_motion_depth.shape == motion_view.shape:
+            motion_diff = np.abs(
+                motion_view.astype(np.int16) - self._prev_motion_depth.astype(np.int16)
+            )
+            mean_motion_diff = float(motion_diff.mean())
+        else:
+            mean_motion_diff = 255.0
+
+        self._prev_motion_depth = motion_view.copy()
+
+        # Compute zone scores (2 rows)
+        far_zones, near_zones = compute_zone_scores(roi)
+
+        far_scores = [z.obstacle_score for z in far_zones]
+        near_scores = [z.obstacle_score for z in near_zones]
+        near_center_3 = [near_scores[2], near_scores[3], near_scores[4]]
+        near_center_min = min(near_center_3)
+        near_center_avg = sum(near_center_3) / 3.0
+        near_left_avg = sum(near_scores[:3]) / 3.0
+        near_right_avg = sum(near_scores[4:]) / 3.0
+
+        # Coverage plateau detector (open-room repetitive scene).
+        zone_signature = np.array(far_scores + near_scores, dtype=np.float32)
+        if self._prev_zone_signature is not None and self._prev_zone_signature.shape == zone_signature.shape:
+            signature_diff = float(np.mean(np.abs(zone_signature - self._prev_zone_signature)))
+        else:
+            signature_diff = 255.0
+        self._prev_zone_signature = zone_signature
+
+        open_room_scene = (
+            near_center_avg > COVERAGE_OPEN_CENTER_THRESHOLD
+            and near_left_avg > COVERAGE_OPEN_SIDE_THRESHOLD
+            and near_right_avg > COVERAGE_OPEN_SIDE_THRESHOLD
+        )
+
+        def _find_far_doorway_cmd() -> DrivingCommand | None:
+            gaps = []
+            gap_start = None
+            gap_sum = 0.0
+
+            for i, score in enumerate(far_scores):
+                if score >= DOORWAY_COMMIT_MIN_FAR_SCORE:
+                    if gap_start is None:
+                        gap_start = i
+                        gap_sum = score
+                    else:
+                        gap_sum += score
+                elif gap_start is not None:
+                    width = i - gap_start
+                    center = gap_start + width / 2.0
+                    avg = gap_sum / width
+                    gaps.append((center, width, avg))
+                    gap_start = None
+                    gap_sum = 0.0
+
+            if gap_start is not None:
+                width = len(far_scores) - gap_start
+                center = gap_start + width / 2.0
+                avg = gap_sum / width
+                gaps.append((center, width, avg))
+
+            doorway_gaps = [g for g in gaps if 1 <= g[1] <= DOORWAY_COMMIT_MAX_WIDTH]
+            if not doorway_gaps:
+                return None
+
+            # Prefer clearer doorway gaps; tie-break toward central openings.
+            center, _, _ = max(doorway_gaps, key=lambda g: (g[2], -abs(g[0] - 3.0)))
+            if center < DOORWAY_COMMIT_LEFT_EDGE:
+                return DrivingCommand.FORWARD_LEFT
+            if center > DOORWAY_COMMIT_RIGHT_EDGE:
+                return DrivingCommand.FORWARD_RIGHT
+            return DrivingCommand.FORWARD
+
+        if (COVERAGE_MODE_ENABLED
+                and open_room_scene
+                and signature_diff < COVERAGE_PLATEAU_DIFF_THRESHOLD):
+            self._coverage_plateau_frames += 1
+        else:
+            self._coverage_plateau_frames = 0
+
+        if self._coverage_sweep_cooldown > 0:
+            self._coverage_sweep_cooldown -= 1
+
+        near_blocked_count = sum(
+            1 for s in near_scores if s < REVERSE_BLOCKED_CENTER_THRESHOLD
+        )
+
+        blocked_scene = (
+            near_center_min < REVERSE_BLOCKED_CENTER_THRESHOLD
+            and near_blocked_count >= REVERSE_BLOCKED_MIN_NEAR_ZONES
+        )
+        if blocked_scene:
+            self._blocked_near_frames += 1
+        else:
+            self._blocked_near_frames = 0
+
+        soft_stuck_scene = (
+            SOFT_STUCK_ENABLED
+            and near_center_avg < SOFT_STUCK_CENTER_THRESHOLD
+            and max(near_left_avg, near_right_avg) < SOFT_STUCK_SIDE_THRESHOLD
+        )
+        if soft_stuck_scene:
+            self._soft_stuck_frames += 1
+        else:
+            self._soft_stuck_frames = 0
+
+        static_stuck_scene = (
+            mean_motion_diff < STATIC_STUCK_DIFF_THRESHOLD
+            and near_center_avg < STATIC_STUCK_CENTER_MAX
+        )
+        if static_stuck_scene:
+            self._static_stuck_frames += 1
+        else:
+            self._static_stuck_frames = 0
+
+        static_stuck_confirmed = self._static_stuck_frames >= STATIC_STUCK_CONFIRM_FRAMES
+        soft_stuck_confirmed = self._soft_stuck_frames >= SOFT_STUCK_CONFIRM_FRAMES
+
+        hard_reverse_now = (
+            near_center_avg < REVERSE_IMMEDIATE_CENTER_THRESHOLD
+            or self._blocked_near_frames >= REVERSE_BLOCKED_CONFIRM_FRAMES
+        )
+        soft_reverse_now = (
+            static_stuck_confirmed
+            or soft_stuck_confirmed
+            or self._soft_reverse_hold_frames > 0
+        )
+
+        # Keep soft reverse temporary (not sticky forever).
+        if self._soft_reverse_hold_frames > 0:
+            self._soft_reverse_hold_frames -= 1
+
+        # After backing out, give a short grace period to move forward again.
+        if self._post_reverse_soft_grace > 0:
+            self._post_reverse_soft_grace -= 1
+            soft_reverse_now = False
+
+        # If we are already reversing and hard reverse is not required,
+        # do not keep extending reverse from soft/static signals only.
+        if (self._last_command in (
+                DrivingCommand.REVERSE,
+                DrivingCommand.REVERSE_LEFT,
+                DrivingCommand.REVERSE_RIGHT,
+            ) and not hard_reverse_now):
+            soft_reverse_now = False
+
+        must_reverse_now = hard_reverse_now or soft_reverse_now
+
+        if must_reverse_now:
+            self._coverage_sweep_frames = 0
+            self._coverage_plateau_frames = 0
+            self._doorway_commit_frames = 0
+
+        # Decide raw command
+        if must_reverse_now:
+            self._consecutive_reverse += 1
+            self._steer_pid.reset()
+
+            if hard_reverse_now and self._consecutive_reverse > REVERSE_ESCAPE_FRAMES:
+                raw_cmd = (
+                    DrivingCommand.REVERSE_LEFT
+                    if near_left_avg >= near_right_avg
+                    else DrivingCommand.REVERSE_RIGHT
+                )
+            elif soft_reverse_now:
+                if self._last_command not in (
+                    DrivingCommand.REVERSE,
+                    DrivingCommand.REVERSE_LEFT,
+                    DrivingCommand.REVERSE_RIGHT,
+                ):
+                    self._soft_reverse_hold_frames = max(0, SOFT_REVERSE_HOLD_FRAMES - 1)
+                if near_left_avg > near_right_avg + SOFT_STUCK_TURN_MARGIN:
+                    raw_cmd = DrivingCommand.REVERSE_LEFT
+                elif near_right_avg > near_left_avg + SOFT_STUCK_TURN_MARGIN:
+                    raw_cmd = DrivingCommand.REVERSE_RIGHT
+                else:
+                    raw_cmd = DrivingCommand.REVERSE
+            else:
+                raw_cmd = DrivingCommand.REVERSE
+
+            self._escape_phase = 0
+            if DEBUG_NAVIGATION:
+                print(
+                    f"[NAV] -> {raw_cmd.name} "
+                    f"(blocked near: center_avg={near_center_avg:.0f}, "
+                    f"blocked_count={near_blocked_count}, "
+                    f"frames={self._blocked_near_frames}, "
+                    f"motion_diff={mean_motion_diff:.2f}, "
+                    f"static_frames={self._static_stuck_frames}, "
+                    f"soft_frames={self._soft_stuck_frames})"
+                )
+        else:
+            pid_left_bonus = 0.0
+            pid_right_bonus = 0.0
+
+            if PID_STEERING_ENABLED:
+                near_left = sum(near_scores[:3]) / 3.0
+                near_right = sum(near_scores[4:]) / 3.0
+                far_left = sum(far_scores[:3]) / 3.0
+                far_right = sum(far_scores[4:]) / 3.0
+
+                # Positive error means right is more open than left.
+                # NEAR row gets higher weight to reduce obstacle-side wobble.
+                left_metric = 0.7 * near_left + 0.3 * far_left
+                right_metric = 0.7 * near_right + 0.3 * far_right
+                steer_error = right_metric - left_metric
+
+                now = time.perf_counter()
+                dt = now - self._last_pid_time
+                self._last_pid_time = now
+
+                pid_out = self._steer_pid.update(steer_error, dt)
+                if abs(pid_out) < PID_DEADBAND:
+                    pid_out = 0.0
+
+                if pid_out >= 0.0:
+                    pid_right_bonus = pid_out * PID_BONUS_SCALE
+                else:
+                    pid_left_bonus = -pid_out * PID_BONUS_SCALE
+
+            raw_cmd, self._consecutive_reverse, self._escape_phase = decide_command(
+                far_zones=far_zones,
+                near_zones=near_zones,
+                consecutive_reverse=self._consecutive_reverse,
+                escape_phase=self._escape_phase,
+                last_command=self._last_command,
+                exploration=self._exploration,
+                pid_left_bonus=pid_left_bonus,
+                pid_right_bonus=pid_right_bonus,
+            )
+
+        doorway_commit_active = False
+        if DOORWAY_COMMIT_ENABLED and not must_reverse_now:
+            if self._doorway_commit_frames > 0:
+                self._doorway_commit_frames -= 1
+                if near_center_avg >= DOORWAY_COMMIT_CANCEL_CENTER:
+                    raw_cmd = self._doorway_commit_cmd
+                    doorway_commit_active = True
+                    self._steer_pid.reset()
+                else:
+                    self._doorway_commit_frames = 0
+            elif (
+                near_center_avg >= DOORWAY_COMMIT_MIN_NEAR_CENTER
+                and self._coverage_sweep_frames == 0
+            ):
+                _door_cmd = _find_far_doorway_cmd()
+                if _door_cmd is not None:
+                    self._doorway_commit_cmd = _door_cmd
+                    self._doorway_commit_frames = max(0, DOORWAY_COMMIT_FRAMES - 1)
+                    self._coverage_plateau_frames = 0
+                    raw_cmd = _door_cmd
+                    doorway_commit_active = True
+                    self._steer_pid.reset()
+                    if DEBUG_NAVIGATION:
+                        print(f"[NAV] Doorway commit start: {self._doorway_commit_cmd.name} ({DOORWAY_COMMIT_FRAMES})")
+
+        # Coverage sweep override: periodically pan across open rooms so the
+        # camera gets a broader look and the car is more likely to find exits.
+        if COVERAGE_MODE_ENABLED and not must_reverse_now and not doorway_commit_active:
+            if (
+                self._coverage_sweep_frames == 0
+                and self._coverage_sweep_cooldown == 0
+                and self._coverage_plateau_frames >= COVERAGE_PLATEAU_CONFIRM_FRAMES
+            ):
+                self._coverage_sweep_dir = "left" if self._coverage_toggle_left else "right"
+                self._coverage_toggle_left = not self._coverage_toggle_left
+                self._coverage_sweep_frames = COVERAGE_SWEEP_FRAMES
+                self._coverage_sweep_cooldown = COVERAGE_SWEEP_COOLDOWN_FRAMES
+                self._coverage_plateau_frames = 0
+                if DEBUG_NAVIGATION:
+                    print(f"[NAV] Coverage sweep start: {self._coverage_sweep_dir}")
+
+            if self._coverage_sweep_frames > 0:
+                self._coverage_sweep_frames -= 1
+                self._steer_pid.reset()
+                raw_cmd = (
+                    DrivingCommand.FORWARD_LEFT
+                    if self._coverage_sweep_dir == "left"
+                    else DrivingCommand.FORWARD_RIGHT
+                )
+
+        # Smooth
+        smoothed_cmd = self._smoother.push(raw_cmd)
+
+        # ------------------------------------------------------------------
+        # Loop breaker: track reverses; force a sustained turn when looping
+        # ------------------------------------------------------------------
+        _is_rev = smoothed_cmd in (
+            DrivingCommand.REVERSE, DrivingCommand.REVERSE_LEFT, DrivingCommand.REVERSE_RIGHT
+        )
+        self._reverse_history.append(1 if _is_rev else 0)
+
+        if must_reverse_now:
+            self._loop_breaker_frames = 0
+            self._reverse_history.clear()
+
+        if LOOP_BREAKER_ENABLED and self._loop_breaker_frames == 0:
+            if sum(self._reverse_history) >= LOOP_REVERSE_THRESHOLD:
+                # Choose the less-used turn direction so we explore new areas
+                exp = self._exploration
+                lefts  = exp._turn_history.count("left")
+                rights = exp._turn_history.count("right")
+                self._loop_breaker_dir = "left" if rights >= lefts else "right"
+                self._loop_breaker_frames = LOOP_BREAKER_FRAMES
+                self._reverse_history.clear()
+                if DEBUG_NAVIGATION:
+                    print(f"[NAV] Loop breaker: forcing {self._loop_breaker_dir} for {LOOP_BREAKER_FRAMES} frames")
+
+        if LOOP_BREAKER_ENABLED and self._loop_breaker_frames > 0 and not must_reverse_now:
+            self._loop_breaker_frames -= 1
+            self._steer_pid.reset()
+            smoothed_cmd = (
+                DrivingCommand.FORWARD_LEFT
+                if self._loop_breaker_dir == "left"
+                else DrivingCommand.FORWARD_RIGHT
+            )
+
+        self._last_command = smoothed_cmd
+
+        # Transition: reverse -> non-reverse. Start grace window so we can
+        # actually drive out instead of re-triggering soft/static reverse.
+        if self._was_reversing and not _is_rev:
+            self._post_reverse_soft_grace = POST_REVERSE_SOFT_GRACE_FRAMES
+            self._static_stuck_frames = 0
+            self._soft_stuck_frames = 0
+            self._soft_reverse_hold_frames = 0
+            self._consecutive_reverse = 0
+        self._was_reversing = _is_rev
+
+        # Update exploration state with the smoothed command
+        self._exploration.record_command(smoothed_cmd)
+
+        return (raw_cmd, smoothed_cmd, far_zones, near_zones)
+
+
+# ===========================================================================
+# Visual overlay
+# ===========================================================================
+
+_CMD_LABELS: dict[DrivingCommand, str] = {
+    DrivingCommand.FORWARD:       "^ FORWARD",
+    DrivingCommand.FORWARD_LEFT:  "<< FWD+LEFT",
+    DrivingCommand.FORWARD_RIGHT: ">> FWD+RIGHT",
+    DrivingCommand.REVERSE:       "v REVERSE",
+    DrivingCommand.REVERSE_LEFT:  "<< REV+LEFT",
+    DrivingCommand.REVERSE_RIGHT: ">> REV+RIGHT",
+    DrivingCommand.BRAKE:         "[STOP]",
+}
+
+_ZONE_COLORS: dict[ZoneState, tuple[int, int, int]] = {
+    ZoneState.CLEAR:     (0, 200, 0),
+    ZoneState.UNCERTAIN: (0, 200, 220),
+    ZoneState.BLOCKED:   (0, 0, 220),
+}
+
+
+def draw_nav_overlay(
+    display: np.ndarray,
+    depth_u8: np.ndarray,
+    far_zones: list,
+    near_zones: list,
+    raw_cmd: DrivingCommand,
+    smoothed_cmd: DrivingCommand,
+) -> None:
+    """Draw the 2-row perspective-aware navigation overlay."""
+    h, w = depth_u8.shape
+    row0 = int(h * NAV_ROW_START)
+    roi_h = h - row0
+    
+    # Split ROI into far (top 40%) and near (bottom 60%)
+    far_row_end = row0 + int(roi_h * 0.4)
+    
+    overlay = display.copy()
+    
+    # ------------------------------------------------------------------
+    # FAR ROW: 7 zones
+    # ------------------------------------------------------------------
+    far_zone_width = w // 7
+    for i, zone in enumerate(far_zones):
+        x1 = i * far_zone_width
+        x2 = (i + 1) * far_zone_width if i < 6 else w
+        color = _ZONE_COLORS.get(zone.state, (128, 128, 128))
+        cv2.rectangle(overlay, (x1, row0), (x2 - 1, far_row_end - 1), color, -1)
+    
+    # ------------------------------------------------------------------
+    # NEAR ROW: 7 zones
+    # ------------------------------------------------------------------
+    near_zone_width = w // 7
+    for i, zone in enumerate(near_zones):
+        x1 = i * near_zone_width
+        x2 = (i + 1) * near_zone_width if i < 6 else w
+        color = _ZONE_COLORS.get(zone.state, (128, 128, 128))
+        cv2.rectangle(overlay, (x1, far_row_end), (x2 - 1, h - 1), color, -1)
+    
+    cv2.addWeighted(overlay, 0.28, display, 0.72, 0, display)
+    
+    # ------------------------------------------------------------------
+    # FAR ROW borders + scores
+    # ------------------------------------------------------------------
+    for i, zone in enumerate(far_zones):
+        x1 = i * far_zone_width
+        x2 = (i + 1) * far_zone_width if i < 6 else w
+        cx = (x1 + x2) // 2
+        
+        cv2.rectangle(display, (x1, row0), (x2 - 1, far_row_end - 1),
+                      (255, 255, 255), 1, cv2.LINE_AA)
+        
+        # Zone label
+        cv2.putText(display, zone.name, (x1 + 2, row0 + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (220, 220, 220), 1, cv2.LINE_AA)
+        
+        # Score
+        score_label = f"{zone.obstacle_score:.0f}"
+        (sw, sh), _ = cv2.getTextSize(score_label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        sx = cx - sw // 2
+        sy = (row0 + far_row_end) // 2 + sh // 2
+        cv2.putText(display, score_label, (sx, sy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(display, score_label, (sx, sy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    
+    # ------------------------------------------------------------------
+    # NEAR ROW borders + scores
+    # ------------------------------------------------------------------
+    for i, zone in enumerate(near_zones):
+        x1 = i * near_zone_width
+        x2 = (i + 1) * near_zone_width if i < 6 else w
+        cx = (x1 + x2) // 2
+        
+        cv2.rectangle(display, (x1, far_row_end), (x2 - 1, h - 1),
+                      (255, 255, 255), 1, cv2.LINE_AA)
+        
+        # Zone label
+        cv2.putText(display, zone.name, (x1 + 2, far_row_end + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (220, 220, 220), 1, cv2.LINE_AA)
+        
+        # Score
+        score_label = f"{zone.obstacle_score:.0f}"
+        (sw, sh), _ = cv2.getTextSize(score_label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        sx = cx - sw // 2
+        sy = (far_row_end + h) // 2 + sh // 2
+        cv2.putText(display, score_label, (sx, sy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(display, score_label, (sx, sy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    
+    # ------------------------------------------------------------------
+    # Command labels
+    # ------------------------------------------------------------------
+    smooth_label = _CMD_LABELS.get(smoothed_cmd, smoothed_cmd.name)
+    (tw, th), _ = cv2.getTextSize(smooth_label, cv2.FONT_HERSHEY_DUPLEX, 1.0, 2)
+    tx = (w - tw) // 2
+    ty = max(th + 4, row0 - 8)
+    cv2.putText(display, smooth_label, (tx, ty),
+                cv2.FONT_HERSHEY_DUPLEX, 1.0, (0, 0, 0), 5, cv2.LINE_AA)
+    cv2.putText(display, smooth_label, (tx, ty),
+                cv2.FONT_HERSHEY_DUPLEX, 1.0, (255, 255, 255), 2, cv2.LINE_AA)
+    
+    raw_label = "raw: " + _CMD_LABELS.get(raw_cmd, raw_cmd.name)
+    (rw, rh), _ = cv2.getTextSize(raw_label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
+    rx = w - rw - 4
+    ry = rh + 4
+    cv2.putText(display, raw_label, (rx, ry),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 2, cv2.LINE_AA)
+    cv2.putText(display, raw_label, (rx, ry),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1, cv2.LINE_AA)
+
+
+# ===========================================================================
+# Camera selector
+# ===========================================================================
+
+def _probe_local_cameras() -> list[tuple[int, str]]:
+    """Probe cv2.VideoCapture indices 0..CAMERA_SCAN_LIMIT-1."""
+    found = []
+    for idx in range(CAMERA_SCAN_LIMIT):
+        cap = cv2.VideoCapture(idx)
+        if cap.isOpened():
+            ok, _ = cap.read()
+            if ok:
+                label = f"Camera {idx}"
+                if idx == 0:
+                    label += " (built-in / default)"
+                found.append((idx, label))
+        cap.release()
+    return found
+
+
+def select_camera():
+    """Interactive terminal camera picker."""
+    print("\n" + "=" * 56)
+    print("  Camera Selector")
+    print("=" * 56)
+
+    print("Scanning for local / USB / Continuity cameras…")
+    local_cams = _probe_local_cameras()
+
+    options: list[tuple[str, str]] = []
+
+    for idx, label in local_cams:
+        options.append((label, f"local:{idx}"))
+
+    options.append(("ESP32-CAM  (enter IP)", "esp32"))
+    options.append(("RTSP stream (enter URL)", "rtsp"))
+    options.append(("HTTP MJPEG  (enter URL)", "mjpeg"))
+
+    if not local_cams:
+        print("  (no local cameras found)\n")
+    else:
+        print()
+
+    for i, (label, _) in enumerate(options):
+        print(f"  [{i}] {label}")
+
+    print()
+
+    while True:
+        raw = input(f"Select source [0–{len(options) - 1}]: ").strip()
+        if raw.isdigit() and 0 <= int(raw) < len(options):
+            choice_idx = int(raw)
+            break
+        print(f"  Please enter a number between 0 and {len(options) - 1}.")
+
+    _, source_key = options[choice_idx]
+
+    if source_key.startswith("local:"):
+        cam_idx = int(source_key.split(":")[1])
+        print(f"\n[INFO] Opening camera index {cam_idx}…")
+        cap = cv2.VideoCapture(cam_idx)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAPTURE_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if not cap.isOpened():
+            print(f"[ERROR] Could not open camera {cam_idx}. Exiting.")
+            exit(1)
+        return cap
+
+    elif source_key == "esp32":
+        ip = input("  ESP32-CAM IP (e.g. 192.168.1.100): ").strip()
+        url = f"http://{ip}:81/stream"
+        print(f"\n[INFO] Connecting to ESP32-CAM: {url}")
+        return MJPEGCapture(url)
+
+    elif source_key == "rtsp":
+        url = input("  RTSP URL (e.g. rtsp://192.168.1.x:554/stream): ").strip()
+        print(f"\n[INFO] Opening RTSP stream: {url}")
+        cap = cv2.VideoCapture(url)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if not cap.isOpened():
+            print(f"[ERROR] Could not open RTSP stream. Check the URL and try again.")
+            exit(1)
+        return cap
+
+    elif source_key == "mjpeg":
+        url = input("  HTTP MJPEG URL (e.g. http://192.168.1.x:8080/video): ").strip()
+        print(f"\n[INFO] Connecting to MJPEG stream: {url}")
+        return MJPEGCapture(url)
+
+
+# ===========================================================================
+# Main loop
+# ===========================================================================
+def main():
+    print("[INFO] Loading CoreML depth model...")
+    depth_model = DepthAnythingV2CoreML(MODEL_PATH, colormap=COLORMAP)
+    print(f"[INFO] Model ready: {MODEL_PATH}")
+    print(f"       input={depth_model.input_width}x{depth_model.input_height}")
+
+    cap = select_camera()
+
+    navigator  = Navigator()
+    controller = KeyController()
+
+    prev_time     = time.perf_counter()
+    frame_count   = 0
+    last_depth    = None
+    last_depth_u8 = None
+
+    last_far_zones = [
+        ZoneInfo(name=f"F{i+1}", mean_depth=0.0, obstacle_score=0.0, state=ZoneState.UNCERTAIN)
+        for i in range(7)
+    ]
+    last_near_zones = [
+        ZoneInfo(name=f"N{i+1}", mean_depth=0.0, obstacle_score=0.0, state=ZoneState.UNCERTAIN)
+        for i in range(7)
+    ]
+    last_raw_cmd      = DrivingCommand.BRAKE
+    last_smoothed_cmd = DrivingCommand.BRAKE
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                time.sleep(0.005)
+                continue
+
+            frame_count += 1
+            if FLIP_HORIZONTAL and FLIP_VERTICAL:
+                frame = cv2.flip(frame, -1)
+            elif FLIP_HORIZONTAL:
+                frame = cv2.flip(frame, 1)
+            elif FLIP_VERTICAL:
+                frame = cv2.flip(frame, 0)
+
+            if frame_count % FRAME_SKIP == 0:
+                try:
+                    last_depth, last_depth_u8 = run_inference(frame, depth_model)
+                except Exception as exc:
+                    print(f"[ERROR] Inference failed: {exc}")
+                    controller.send(DrivingCommand.BRAKE)
+                    continue
+
+            if last_depth is None:
+                time.sleep(0.005)
+                continue
+
+            display = last_depth.copy()
+
+            raw_cmd, smoothed_cmd, far_zones, near_zones = navigator.process_frame(last_depth_u8)
+
+            controller.send(smoothed_cmd)
+
+            last_far_zones = far_zones
+            last_near_zones = near_zones
+            last_raw_cmd = raw_cmd
+            last_smoothed_cmd = smoothed_cmd
+
+            draw_nav_overlay(display, last_depth_u8, last_far_zones, last_near_zones, last_raw_cmd, last_smoothed_cmd)
+
+            # HUD
+            now = time.perf_counter()
+            fps = 1.0 / max(now - prev_time, 1e-6)
+            prev_time = now
+
+            cv2.putText(display, f"FPS: {fps:.1f}", (8, 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(display, "CoreML (DepthAnythingV2SmallF16)",
+                        (8, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
+
+            # Exploration HUD (shown when EXPLORATION_ENABLED)
+            if EXPLORATION_ENABLED:
+                exp = navigator._exploration
+                lefts  = exp._turn_history.count("left")
+                rights = exp._turn_history.count("right")
+                exp_label = f"Explore | L:{lefts} R:{rights}"
+                if exp.came_from_timer > 0:
+                    exp_label += f" | bias:{exp.came_from_side}({exp.came_from_timer})"
+                if EXIT_AVOIDANCE_ENABLED and exp.outside_timer > 0:
+                    exp_label += f" | out:{exp.outside_side}({exp.outside_timer})"
+                if LOOP_BREAKER_ENABLED and navigator._loop_breaker_frames > 0:
+                    exp_label += f" | loop→{navigator._loop_breaker_dir}({navigator._loop_breaker_frames})"
+                if DOORWAY_COMMIT_ENABLED and navigator._doorway_commit_frames > 0:
+                    exp_label += f" | door:{navigator._doorway_commit_cmd.name}({navigator._doorway_commit_frames})"
+                if COVERAGE_MODE_ENABLED and navigator._coverage_sweep_frames > 0:
+                    exp_label += f" | sweep:{navigator._coverage_sweep_dir}({navigator._coverage_sweep_frames})"
+                cv2.putText(display, exp_label, (8, 72),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 220, 255), 1, cv2.LINE_AA)
+
+            side = np.hstack([frame, display])
+            cv2.imshow("Depth WASD Navigation (CoreML)", side)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+    finally:
+        controller.release_all()
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
