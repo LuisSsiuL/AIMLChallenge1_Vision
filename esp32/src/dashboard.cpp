@@ -28,8 +28,11 @@ extern const char DASHBOARD_HTML[] PROGMEM = R"HTML(
 </div>
 <div id="log">ready</div>
 <script>
+// Pulse-driven: while key held, POST /cmd every 50ms.
+// ESP auto-stops if no cmd in 600ms (deadman).
 const keys = {w:false,a:false,s:false,d:false};
 const log = document.getElementById('log');
+const PULSE_MS = 50;
 
 function send(k, down){
   fetch(`/cmd?k=${k}&s=${down?1:0}`).catch(e => log.textContent = 'cmd err: '+e);
@@ -40,6 +43,9 @@ function paint(){
   }
   log.textContent = `W=${+keys.w} A=${+keys.a} S=${+keys.s} D=${+keys.d}`;
 }
+setInterval(() => {
+  for (const k of ['w','a','s','d']) if (keys[k]) send(k, true);
+}, PULSE_MS);
 addEventListener('keydown', e => {
   const k = e.key.toLowerCase();
   if (!(k in keys) || keys[k]) return;

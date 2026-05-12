@@ -20,6 +20,18 @@ WebServer server(80);
 // ============ Motor control ============
 // Phase/enable mode (Bluino tutorial). W/A/D confirmed working, S does not.
 static bool keyW = false, keyA = false, keyS = false, keyD = false;
+static unsigned long lastCmdMs = 0;
+static unsigned long cmdCount = 0;
+static unsigned long lastWifiLogMs = 0;
+static const unsigned long DEADMAN_MS = 1500;  // grace for lossy WiFi (was 600, hot stops)
+
+static void wifiHealthLog() {
+  if (millis() - lastWifiLogMs < 3000) return;
+  lastWifiLogMs = millis();
+  Serial.printf("[wifi] RSSI=%d dBm  cmds/3s=%lu  ip=%s\n",
+                WiFi.RSSI(), cmdCount, WiFi.localIP().toString().c_str());
+  cmdCount = 0;
+}
 
 static void applyMotors() {
 #if MOTORS_ENABLED
@@ -30,7 +42,8 @@ static void applyMotors() {
   else if (keyA) { digitalWrite(LEFT_DIR_PIN, HIGH); digitalWrite(RIGHT_DIR_PIN, LOW);  }
   else if (keyD) { digitalWrite(LEFT_DIR_PIN, LOW);  digitalWrite(RIGHT_DIR_PIN, HIGH); }
 
-  int speed = active ? MOTOR_SPEED : 0;
+  // S barely overcomes friction — give reverse max duty.
+  int speed = !active ? 0 : (keyS ? 255 : MOTOR_SPEED);
   ledcWrite(0, speed);
   ledcWrite(4, speed);
 
@@ -63,15 +76,26 @@ static void handleCmd() {
   }
   char k = tolower(server.arg("k").charAt(0));
   bool down = server.arg("s") == "1";
+  bool changed = false;
   switch (k) {
-    case 'w': keyW = down; break;
-    case 'a': keyA = down; break;
-    case 's': keyS = down; break;
-    case 'd': keyD = down; break;
+    case 'w': if (keyW != down) { keyW = down; changed = true; } break;
+    case 'a': if (keyA != down) { keyA = down; changed = true; } break;
+    case 's': if (keyS != down) { keyS = down; changed = true; } break;
+    case 'd': if (keyD != down) { keyD = down; changed = true; } break;
     default: server.send(400, "text/plain", "bad key"); return;
   }
-  applyMotors();
+  lastCmdMs = millis();
+  cmdCount++;
+  if (changed) applyMotors();
   server.send(200, "text/plain", "ok");
+}
+
+static void deadmanCheck() {
+  if ((keyW || keyA || keyS || keyD) && (millis() - lastCmdMs > DEADMAN_MS)) {
+    keyW = keyA = keyS = keyD = false;
+    applyMotors();
+    Serial.println("[deadman] no cmd, motors stop");
+  }
 }
 
 // MJPEG streaming — pulls JPEG from camera, wraps in multipart
@@ -85,6 +109,8 @@ static void handleStream() {
 
   while (client.connected()) {
     server.handleClient();   // service /cmd etc. between frames
+    deadmanCheck();
+    wifiHealthLog();
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) { delay(10); continue; }
     client.printf("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
@@ -139,6 +165,8 @@ void setup() {
   Serial.printf("[wifi] connecting to %s", WIFI_SSID);
   while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
   Serial.printf("\n[wifi] ip = http://%s/\n", WiFi.localIP().toString().c_str());
+  Serial.printf("[wifi] gateway = %s\n", WiFi.gatewayIP().toString().c_str());
+  Serial.printf("[wifi] RSSI = %d dBm  (good > -65, weak < -75)\n", WiFi.RSSI());
 
   server.on("/", handleRoot);
   server.on("/cmd", handleCmd);
@@ -149,4 +177,6 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  deadmanCheck();
+  wifiHealthLog();
 }

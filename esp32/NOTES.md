@@ -69,11 +69,15 @@ extern const char DASHBOARD_HTML[] PROGMEM = R"HTML(...)HTML";
 | W   | HIGH              | HIGH               | 200     | forward ✅           |
 | A   | HIGH              | LOW                | 200     | turn left ✅         |
 | D   | LOW               | HIGH               | 200     | turn right ✅        |
-| S   | LOW               | LOW                | 200     | **NOT WORKING** ❌    |
+| S   | LOW               | LOW                | **255** | reverse ✅ (needs max PWM, 200 too weak to overcome friction) |
 
 Serial print confirms correct pin state on S — wheels just don't move. Driver IC ignores/brakes that combo.
 
-## S Reverse — Software Attempts That FAILED
+## S Reverse — SOLVED ✅
+
+Root cause: PWM duty 200 (~78%) wasn't enough torque to overcome **static friction in reverse direction** (gear backlash + brushed-motor asymmetry). Bumping reverse duty to 255 (100%) breaks static friction, motors spin.
+
+Code: `if (keyS) duty = 255; else duty = MOTOR_SPEED;`. Forward still uses 200 for controlled speed.
 
 | Attempt | Result |
 |---------|--------|
