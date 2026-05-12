@@ -42,3 +42,11 @@ build/
 
 # Plans / scratch
 .planning/
+
+# Tooling venvs
+tools/venv_depth/
+tools/**/venv/
+
+# Random captures
+WhatsApp Image*.jpeg
+image.png
