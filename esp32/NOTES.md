@@ -19,19 +19,61 @@ board = esp32cam
 framework = arduino
 monitor_speed = 115200
 upload_speed = 460800
+upload_port  = /dev/cu.usbserial-110
+monitor_port = /dev/cu.usbserial-110
 build_flags =
     -DBOARD_HAS_PSRAM
     -DCORE_DEBUG_LEVEL=3
+    -DELEGANTOTA_USE_ASYNC_WEBSERVER=0
 lib_deps =
     esp32-camera
+    links2004/WebSockets@^2.4.1
+    ayushsharma82/ElegantOTA@^3.1.5
 ```
 
 ## Camera Config
 
-- Resolution: `FRAMESIZE_QVGA` (320×240). VGA stuttered over hotspot.
-- `jpeg_quality = 15`, `fb_count = 1`
+- Resolution: `FRAMESIZE_VGA` (640×480) default. Runtime switch via `/res?size=qvga|cif|vga|svga|xga|hd|sxga|uxga` + dashboard dropdown.
+- `jpeg_quality = 12`, `fb_count = 2` (double-buffer for smoother MJPEG)
 - Camera uses `LEDC_CHANNEL_2` + `LEDC_TIMER_1` internally
 - **`cameraInit()` MUST run BEFORE `motorsInit()`** (otherwise SCCB write fails `0x20002`)
+- Sensor tuning post-init: brightness/contrast/saturation +1, AWB on, AEC2 on, lens correction on.
+
+### Resolution / FPS / bandwidth trade-off (OV2640 @ 20MHz XCLK, PSRAM)
+
+| Size  | Pixels      | Approx FPS  | Notes                                              |
+|-------|-------------|-------------|----------------------------------------------------|
+| QVGA  | 320×240     | 20–30       | Lowest latency, decent on weak WiFi                |
+| CIF   | 400×296     | ~20         |                                                    |
+| VGA   | 640×480     | 15–20       | **Default — sweet spot**                           |
+| SVGA  | 800×600     | 10–15       | Bandwidth tight on hotspot                         |
+| XGA   | 1024×768    | 7–10        |                                                    |
+| HD    | 1280×720    | 5–8         | OV2640 max useful for streaming                    |
+| UXGA  | 1600×1200   | 1–3         | Crashes at high quality; usable for snapshots only |
+
+Bumping resolution → push `jpeg_quality` to 15–20 to avoid corruption (esp32-camera issue #252).
+
+### Runtime sensor tuning (post-init)
+
+```cpp
+sensor_t *s = esp_camera_sensor_get();
+s->set_brightness(s, 1);     // -2..2
+s->set_contrast(s, 1);
+s->set_saturation(s, 1);
+s->set_whitebal(s, 1);       // AWB on
+s->set_awb_gain(s, 1);
+s->set_wb_mode(s, 0);        // 0=auto 1=sunny 2=cloudy 3=office 4=home
+s->set_exposure_ctrl(s, 1);  // AEC on
+s->set_aec2(s, 1);           // AEC DSP
+s->set_gain_ctrl(s, 1);      // AGC on
+s->set_lenc(s, 1);           // lens correction
+```
+
+Caveat from sensor.h: OV2640's SDE register zeros sibling effect bits on each set — call all three (brightness/contrast/saturation) so the last call leaves them all enabled.
+
+### XCLK notes
+- Default 20 MHz works. 24 MHz claims +FPS but increases WiFi interference risk on classic ESP32.
+- 8 MHz fallback if streaming corrupts or WiFi flakes.
 
 ## WiFi / HTTP
 
@@ -50,7 +92,7 @@ lib_deps =
 extern const char DASHBOARD_HTML[] PROGMEM = R"HTML(...)HTML";
 ```
 
-## Motor Pin Map (CONFIRMED working for W/A/D, S unsolvable)
+## Motor Pin Map (CONFIRMED working W/A/S/D)
 
 | Function       | GPIO | LEDC ch | Notes                                |
 |----------------|------|---------|--------------------------------------|
@@ -69,33 +111,70 @@ extern const char DASHBOARD_HTML[] PROGMEM = R"HTML(...)HTML";
 | W   | HIGH              | HIGH               | 200     | forward ✅           |
 | A   | HIGH              | LOW                | 200     | turn left ✅         |
 | D   | LOW               | HIGH               | 200     | turn right ✅        |
-| S   | LOW               | LOW                | **255** | reverse ✅ (needs max PWM, 200 too weak to overcome friction) |
+| S   | LOW               | LOW                | 200     | reverse ✅           |
 
-Serial print confirms correct pin state on S — wheels just don't move. Driver IC ignores/brakes that combo.
+### S Reverse — fix history
+Initially S didn't move at `MOTOR_SPEED=200` while W/A/D did → looked like a shield-protocol issue, but root cause was static friction in reverse direction. Raising S duty to 255 worked. Later unified all four keys to `MOTOR_SPEED` per user preference — if S stalls again, bump `MOTOR_SPEED` itself rather than carving out a special case.
 
-## S Reverse — SOLVED ✅
+```cpp
+int speed = active ? MOTOR_SPEED : 0;
+ledcWrite(0, speed);
+ledcWrite(4, speed);
+```
 
-Root cause: PWM duty 200 (~78%) wasn't enough torque to overcome **static friction in reverse direction** (gear backlash + brushed-motor asymmetry). Bumping reverse duty to 255 (100%) breaks static friction, motors spin.
+## Enhancements (current build)
 
-Code: `if (keyS) duty = 255; else duty = MOTOR_SPEED;`. Forward still uses 200 for controlled speed.
+### 1. WiFi mode toggle — STA / AP
+`config.h`:
+```c
+#define WIFI_AP_MODE 0   // 0 = STA (join network), 1 = AP (ESP creates network)
+```
+- **STA (default):** joins router/hotspot. Keeps internet for Mac → ChatGPT/Claude/etc while driving.
+- **AP:** ESP becomes its own WiFi (`ESPCar` / `esprc1234`). Mac joins ESP directly → lowest latency, no router hop, no isolation issues. No internet though.
 
-| Attempt | Result |
-|---------|--------|
-| Both DIR LOW + both PWM (tutorial logic) | no motion |
-| Dual-PWM mode, pin pairs `{12,14}` and `{13,15}` | **all keys** dead |
-| L298N pairing (AlexeyMal), pin pairs `{14,15}` and `{13,12}` | **all keys** dead — shield NOT wired like a standard L298N car |
-| Inverted PWM duty (duty 55 with DIR HIGH) | no motion |
-| Hybrid: digitalWrite HIGH on dir pin + PWM=0 | buzz only |
-| LEDC on all 4 pins, swap PWM↔dir roles | no reverse |
+Switch by flipping `WIFI_AP_MODE` and re-flashing (or use OTA).
 
-### Likely conclusion
-Bluino ESP32-CAM Motor Shield v3.1 appears designed so reverse direction needs a special control signal from their `kbduino` app firmware (possibly I2S/UART command to an on-board MP3 chip that gates the H-bridge). Reverse not driveable from raw ESP32 GPIO pin toggling.
+### 2. WebSocket command channel — `ws://<ip>:81/`
+HTTP `/cmd` had a TCP handshake per key event (20-80ms each). Replaced with a persistent WebSocket. Message format: `"<key><state>"` e.g. `"w1"` for W-down, `"s0"` for S-up.
 
-### Things still untried
-- Lower `MOTOR_SPEED` to 130 to rule out brown-out
-- Read H-bridge IC label on shield underside (L9110S / TB6612 / DRV8833 / etc.)
-- Decompile Bluino's `kbduino` Android app to find their cmd protocol
-- Open Bluino's "Esp32 Camera WiFi Robot Car" Play Store app, use upload-sketch feature — likely ships a working firmware we can extract pin protocol from
+- Library: `links2004/WebSockets@^2.4.1`
+- Port 81 (HTTP stays on 80)
+- Dashboard auto-connects on load, auto-reconnects on disconnect
+- Falls back to HTTP `/cmd` if WS unavailable (legacy preserved)
+- On client disconnect, all 4 keys force-cleared (safety: prevent runaway if browser tab closes mid-keypress)
+
+Expected: noticeably lower input latency vs edge-triggered HTTP, especially on weak RSSI.
+
+### 3. ElegantOTA — wireless firmware updates
+No more USB-TTL + `IO0→GND` ritual.
+
+- Library: `ayushsharma82/ElegantOTA@^3.1.5`
+- Build flag: `-DELEGANTOTA_USE_ASYNC_WEBSERVER=0` (we use sync `WebServer`, not Async)
+- Endpoint: `http://<ip>/update` — drag-and-drop `.bin` upload UI
+- Firmware bin location after `pio run`: `.pio/build/esp32cam/firmware.bin`
+
+Flow: `pio run` → open `/update` → upload bin → ESP reboots into new firmware.
+
+### 4. Camera double-buffer
+`fb_count = 2` (was 1). Camera captures next frame in PSRAM while current frame ships out. Smoother MJPEG, higher achievable FPS at QVGA. PSRAM has plenty of headroom.
+
+### Endpoints summary
+
+| URL                     | Purpose                              |
+|-------------------------|--------------------------------------|
+| `http://<ip>/`          | Dashboard UI                         |
+| `http://<ip>/stream`    | MJPEG video                          |
+| `http://<ip>/cmd?k=&s=` | HTTP key cmd (legacy fallback)       |
+| `http://<ip>/res?size=&q=` | Runtime resolution + jpeg quality |
+| `http://<ip>/update`    | ElegantOTA firmware upload           |
+| `ws://<ip>:81/`         | WebSocket cmd (primary)              |
+
+### Enhancements still TODO
+
+- **ESP-NOW cmd path** — peer-to-peer sub-2ms; needs second ESP on Mac side. Skip for now.
+- **DMA-streamed FPV** (jeanlemotan/RomanLut style) — sub-100ms glass-to-glass, but full rewrite of camera/network layer. Defer unless MJPEG latency still hurts after WS.
+- **RTSP server** (rzeldent/esp32cam-rtsp) — better OpenCV/VLC integration vs MJPEG multipart parse.
+- **Onboard person detection** — Edge Impulse FOMO 96×96 grayscale. ER survivor detect MVP. Try before committing to RPi/Jetson.
 
 ## Q&A Notes
 
@@ -141,9 +220,8 @@ Bluino ESP32-CAM Motor Shield v3.1 appears designed so reverse direction needs a
 
 ## Next Steps
 
-1. (Optional) Try AP mode for stable streaming with low latency.
-2. (Optional) Per-motor speed: split `ledcWrite` calls + add slider/param.
-3. Wire dashboard JS POST to hand-gesture driver from `drivingsim/` Swift.
-4. Decide on onboard human detection (YOLOv8-nano / MobileNet-SSD); host on Mac or RPi/Jetson.
+1. Per-motor speed: split `ledcWrite` calls + slider/param for smooth curve steering vs pivot.
+2. Wire `drivingsim/` Swift `HandJoystick` keys → WebSocket client to the ESP. Same WASD surface, just point at `ws://<esp-ip>:81/`.
+3. Onboard human detection — try Edge Impulse FOMO first (fits ESP32 classic); RPi/Jetson if accuracy too low.
+4. Analog stop gesture (open palm → all keys clear).
 5. Battery runtime measurement.
-6. Solve S reverse via Bluino's official app firmware extraction.

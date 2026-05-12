@@ -1,8 +1,17 @@
 #pragma once
 
 // ============ WiFi ============
+// Flip WIFI_AP_MODE to 1 for AP mode (Mac joins ESP directly, lowest latency, no internet).
+// Leave 0 to join router/hotspot (default — keeps Claude prompt access).
+#define WIFI_AP_MODE          0
+
+// STA mode — join existing network
 #define WIFI_SSID     "AP RITZ ROYAL"
 #define WIFI_PASSWORD "Ritzroyal219"
+
+// AP mode — ESP creates its own network
+#define WIFI_AP_SSID  "ESPCar"
+#define WIFI_AP_PASS  "esprc1234"   // min 8 chars
 
 // ============ Camera pins — AI-Thinker ESP32-CAM ============
 // Standard AI-Thinker pinout. Do not change unless using different board.
@@ -36,4 +45,4 @@
 
 #define MOTOR_PWM_FREQ     20000
 #define MOTOR_PWM_RES          8
-#define MOTOR_SPEED          200
+#define MOTOR_SPEED          255
