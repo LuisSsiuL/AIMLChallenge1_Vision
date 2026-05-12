@@ -205,34 +205,42 @@ struct ContentView: View {
             }
         }
         .overlay(alignment: .bottomLeading) {
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 8) {
                 Text("W/S accel-brake   A/D steer")
                     .font(.caption)
-                Picker("Mode", selection: $mode) {
-                    ForEach(DrivingMode.allCases) { m in
-                        Text(m.label).tag(m)
+                    .foregroundColor(.white.opacity(0.85))
+                HStack(spacing: 6) {
+                    Text("Mode")
+                        .font(.caption)
+                        .foregroundColor(.white.opacity(0.7))
+                    Picker("", selection: $mode) {
+                        ForEach(DrivingMode.allCases) { m in
+                            Text(m.label).tag(m)
+                        }
                     }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .tint(.white)
+                    .frame(minWidth: 140)
                 }
-                .pickerStyle(.segmented)
-                .frame(width: 280)
                 HStack(spacing: 6) {
                     Circle()
                         .fill(esp32WS.connected ? Color.green : Color.red)
                         .frame(width: 8, height: 8)
                     Text("ESP32 \(esp32WS.connected ? "linked" : "offline") · \(ESP32Config.host)")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.85))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.9))
                     if source.isESP32 {
                         Text("· cam \(String(format: "%.0f", mjpeg.fps)) fps")
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundColor(.white.opacity(0.65))
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.7))
                     }
                 }
             }
             .foregroundColor(.white)
-            .padding(8)
-            .background(.black.opacity(0.45))
-            .cornerRadius(6)
+            .padding(10)
+            .background(.black.opacity(0.55))
+            .cornerRadius(8)
             .padding(12)
         }
         .overlay(alignment: .topTrailing) {
