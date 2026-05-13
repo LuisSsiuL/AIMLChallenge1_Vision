@@ -112,6 +112,17 @@ struct ContentView: View {
         self.esp32Profile = esp32Profile
     }
 
+    /// WASD union (same logic as `wasd` snapshot) packaged as the `Set<UInt16>`
+    /// PoseEstimator expects for dead-reckoning on real hardware.
+    private var activeKeySet: Set<UInt16> {
+        var s: Set<UInt16> = []
+        if anyForward  { s.insert(KeyboardMonitor.W) }
+        if anyBackward { s.insert(KeyboardMonitor.S) }
+        if anyLeft     { s.insert(KeyboardMonitor.A) }
+        if anyRight    { s.insert(KeyboardMonitor.D) }
+        return s
+    }
+
     @ViewBuilder
     private var mainView: some View {
         if source.isLive {
@@ -181,6 +192,9 @@ struct ContentView: View {
                 mjpeg.setOutputSize(width:  mapDrv.inputSize.width,
                                     height: mapDrv.inputSize.height)
                 mjpeg.start()
+                // SimScene won't run — pose must come from dead-reckoning
+                // driven by commanded WASD inside the FPV pump.
+                mapDrv.useTruthPose = false
             } else {
                 // Sim source: build offscreen FPV renderer.
                 fpv = SimFPVRenderer(obstacles: scene.obstacleSnapshot,
@@ -192,6 +206,14 @@ struct ContentView: View {
         }
         .onChange(of: wasd) { _, w in
             esp32WS.publish(forward: w.f, backward: w.b, left: w.l, right: w.r)
+        }
+        .onChange(of: keyboard.inferenceCounter) { _, _ in
+            // `I` key — single-shot depth inference, Explore mode only.
+            if mode == .mapExplore { mapDrv.requestInferenceOnce() }
+        }
+        .onChange(of: keyboard.autoToggleCounter) { _, _ in
+            // `O` key — flip Explore manual ↔ automatic.
+            if mode == .mapExplore { mapDrv.toggleAutoExplore() }
         }
         .onDisappear {
             stopAll()
@@ -263,7 +285,7 @@ struct ContentView: View {
                             .foregroundColor(.white.opacity(0.7))
                     }
                 }
-                if mode.needsDepth {
+                if mode.needsDepth && mode != .autoSeekPy {
                     VStack(spacing: 4) {
                         DepthPreview(driver: depth)
                             .frame(width: 240, height: 240)
@@ -288,14 +310,14 @@ struct ContentView: View {
                     }
                 }
                 if mode == .autoSeekPy {
-                    // Standalone SeekPy (hidden from picker but reachable by code)
+                    // Relative DepthAnythingV2 preview + zone grid. YOLO disabled.
                     VStack(spacing: 4) {
-                        YOLOPyPreviewPanel(driver: yoloPy)
+                        DepthPreview(driver: depthRel)
                             .frame(width: 240, height: 240)
                             .cornerRadius(8)
                             .overlay(RoundedRectangle(cornerRadius: 8)
-                                .stroke(Color.purple.opacity(0.6), lineWidth: 2))
-                        Text("YOLO/Python (\(yoloPy.seekState == .seek ? "SEEK" : "ROAM"))\(yoloPy.pythonReady ? "" : " starting…")")
+                                .stroke(Color.cyan.opacity(0.6), lineWidth: 2))
+                        Text("Depth (SeekPy)")
                             .font(.caption2)
                             .foregroundColor(.white.opacity(0.7))
                     }
@@ -376,6 +398,20 @@ struct ContentView: View {
                     KeyCapView(label: "S", pressed: anyBackward)
                     KeyCapView(label: "D", pressed: anyRight)
                 }
+                if mode == .mapExplore {
+                    HStack(spacing: 4) {
+                        KeyCapView(label: "I", pressed: keyboard.pressed.contains(KeyboardMonitor.I))
+                        Text("scan")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.8))
+                    }
+                    HStack(spacing: 4) {
+                        KeyCapView(label: "O", pressed: keyboard.pressed.contains(KeyboardMonitor.O))
+                        Text(mapDrv.autoActive ? "auto · ON" : "auto · OFF")
+                            .font(.system(size: 11, weight: .bold, design: .monospaced))
+                            .foregroundColor(mapDrv.autoActive ? .green : .white.opacity(0.7))
+                    }
+                }
             }
             .padding(12)
         }
@@ -394,29 +430,38 @@ struct ContentView: View {
     private var seekActive: Bool { mode.anyYOLO && activeYoloSeek == .seek }
     private var roamActive: Bool { mode.anyYOLO && activeYoloSeek == .roam }
 
+    /// Depth source for UI WASD reads: .autoSeekPy uses depthRel; others use depth.
+    private var activeDepth: DepthDriver { mode == .autoSeekPy ? depthRel : depth }
+
     private var anyForward:  Bool {
         keyboard.forward
         || (mode.needsHand  && hand.forward)
-        || (mode.needsDepth && depth.forward)
+        || (mode.needsDepth && activeDepth.forward)
+        || (mode.needsMap   && mapDrv.forward)
         || (seekActive && (activeYoloBest?.h ?? 1) < 0.55)
     }
     private var anyBackward: Bool {
         keyboard.backward
         || (mode.needsHand  && hand.backward)
-        || (mode.needsDepth && depth.backward)
+        || (mode.needsDepth && activeDepth.backward)
+        || (mode.needsMap   && mapDrv.backward)
     }
     private var anyLeft:     Bool {
         keyboard.left
         || (mode.needsHand  && hand.left)
-        || (mode == .automated && depth.left)
-        || (roamActive && depth.left)
+        || (mode == .automated && activeDepth.left)
+        || (mode == .autoSeekPy && activeDepth.left)
+        || (roamActive && activeDepth.left)
+        || (mode.needsMap   && mapDrv.left)
         || (seekActive && (activeYoloBest?.cx ?? 0.5) < 0.45)
     }
     private var anyRight:    Bool {
         keyboard.right
         || (mode.needsHand  && hand.right)
-        || (mode == .automated && depth.right)
-        || (roamActive && depth.right)
+        || (mode == .automated && activeDepth.right)
+        || (mode == .autoSeekPy && activeDepth.right)
+        || (roamActive && activeDepth.right)
+        || (mode.needsMap   && mapDrv.right)
         || (seekActive && (activeYoloBest?.cx ?? 0.5) > 0.55)
     }
 
@@ -426,23 +471,27 @@ struct ContentView: View {
         } else {
             hand.stop()
         }
-        // Map modes need a DepthDriver running for the autoSeekPy controller.
-        let wantsMetric  = newMode.needsDepth
+        // Two depth drivers:
+        //   `depth`    — metric model, used by .autoMap/.mapMetric/.mapExplore + .assisted/.automated
+        //   `depthRel` — relative DepthAnythingV2 SmallF16, used by .autoSeekPy
+        let wantsRel    = (newMode == .autoSeekPy)
+        let wantsMetric = (newMode.needsDepth && !wantsRel)
                            || newMode == .autoMap
                            || newMode == .mapMetric
                            || newMode == .mapExplore
-        if wantsMetric { depth.start()    } else { depth.stop()    }
-        depthRel.stop()   // relative-depth driver retired (.mapDepth removed)
+        if wantsMetric { depth.start() }    else { depth.stop() }
+        if wantsRel    { depthRel.start() } else { depthRel.stop() }
         // Publish raw float meters whenever DepthProjector consumes them.
         depth.setPublishMeters(newMode.usesMetricProjection)
         // Tell MapDriver which behaviour to enter on next start (sweep vs autoSeekPy passive).
         mapDrv.exploreMode = (newMode == .mapExplore)
 
-        // Rebuild FPV renderer to match metric model input size (518×518).
-        // Only applies to the sim source — external sources (live cam / ESP32 MJPEG)
-        // produce frames directly and skip the offscreen renderer.
+        // Source frame size = active depth model's expected input.
+        // autoSeekPy → depthRel (DepthAnythingV2SmallF16, typically 518×392).
+        // others    → depth (metric, 518×518).
+        let activeInputSize = (newMode == .autoSeekPy) ? depthRel.inputSize : depth.inputSize
         if !source.isExternalFrameSource {
-            let (w, h) = depth.inputSize
+            let (w, h) = activeInputSize
             let needRebuild: Bool = {
                 guard let cur = fpv?.outputSize else { return true }
                 return cur.width != w || cur.height != h
@@ -454,9 +503,11 @@ struct ContentView: View {
                                      width: w, height: h)
             }
         } else if source.isESP32 {
-            // Keep MJPEG decode size in sync with the active model input.
-            let (w, h) = depth.inputSize
+            let (w, h) = activeInputSize
             mjpeg.setOutputSize(width: w, height: h)
+        } else if source.isLive {
+            let (w, h) = activeInputSize
+            liveCam.setOutputSize(width: w, height: h)
         }
         if newMode.needsYOLO {
             yolo.start()
@@ -503,7 +554,8 @@ struct ContentView: View {
                 // instead of ~30/s). Other modes keep per-frame inference.
                 let runMetric: Bool = {
                     if mode == .mapExplore { return mapDrv.wantsInference }
-                    return mode.needsDepth || mode == .autoMap || mode == .mapMetric
+                    return (mode.needsDepth && mode != .autoSeekPy)
+                        || mode == .autoMap || mode == .mapMetric
                 }()
                 if runMetric {
                     // Pose at submit time travels with the MetricFrame so
@@ -512,10 +564,18 @@ struct ContentView: View {
                     let pSubmit = mapDrv.poseEstimator
                     depth.submit(buf, posePos: pSubmit.pos, poseYaw: pSubmit.yaw)
                 }
+                // autoSeekPy: relative DepthAnythingV2 (no metric projection).
+                if mode == .autoSeekPy { depthRel.submit(buf) }
                 if mode.needsYOLO    { yolo.submit(buf) }
                 if mode.needsYOLOPy  { yoloPy.submit(buf) }
                 // Sync YOLOPy seek state into MapDriver target tracker (map modes).
                 if mode.needsMap {
+                    // ESP32 path: drive pose dead-reckoning from commanded WASD
+                    // so the occupancy grid + A* have a moving pose to project
+                    // depth against. dt = 1/30 matches the timer interval.
+                    if source.isESP32 {
+                        mapDrv.tickDeadReckoned(keys: activeKeySet, dt: 1.0 / 30.0)
+                    }
                     let pose = mapDrv.poseEstimator
                     if yoloPy.seekState == .seek, let det = yoloPy.bestDetection {
                         mapDrv.updateSeekTarget(

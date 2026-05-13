@@ -51,10 +51,17 @@ final class PoseEstimator: ObservableObject {
             speed = abs(speed) <= drag ? 0 : speed - drag * (speed > 0 ? 1 : -1)
         }
 
-        // Steering
-        let speedFactor = min(1, abs(speed) / steerSpeedRef)
+        // Steering — match SimScene.tick: pure rotation when A/D pressed
+        // without W/S (skid-steer / in-place spin), otherwise speed-coupled.
         let steerInput: Float = (rgt ? 1 : 0) + (lft ? -1 : 0)
-        let yawRate = steerInput * maxSteerRate * speedFactor * (speed >= 0 ? 1 : -1)
+        let inPlaceRotate = (!fwd && !bwd && steerInput != 0)
+        let yawRate: Float
+        if inPlaceRotate {
+            yawRate = steerInput * maxSteerRate
+        } else {
+            let speedFactor = min(1, abs(speed) / steerSpeedRef)
+            yawRate = steerInput * maxSteerRate * speedFactor * (speed >= 0 ? 1 : -1)
+        }
         yaw += yawRate * dt
 
         // Integrate position

@@ -40,12 +40,16 @@ final class MJPEGSource: NSObject, ObservableObject {
     private var session: URLSession?
     private var task: URLSessionDataTask?
     private var running: Bool = false
+    private var reconnecting: Bool = false   // re-entry guard
     private var reconnectAttempt: Int = 0
+    private var stallWatchdog: Timer?
+    private let stallTimeoutSec: TimeInterval = 5.0
 
     // Parser state (mutated only on the delegate queue, not Sendable-shared).
     nonisolated(unsafe) private var buffer = Data()
     nonisolated(unsafe) private var frameCount: Int = 0
     nonisolated(unsafe) private var lastFpsTick: Date = .init()
+    nonisolated(unsafe) private var lastFrameTime: Date = .init()
 
     override init() {
         super.init()
@@ -68,6 +72,7 @@ final class MJPEGSource: NSObject, ObservableObject {
     func stop() {
         guard running else { return }
         running = false
+        stopStallWatchdog()
         task?.cancel()
         task = nil
         session?.invalidateAndCancel()
@@ -105,22 +110,52 @@ final class MJPEGSource: NSObject, ObservableObject {
         print("[MJPEG] connecting → \(ESP32Config.streamURL)")
         let t = s.dataTask(with: req)
         task = t
+        lastFrameTime = Date()
+        startStallWatchdog()
         t.resume()
     }
 
+    private func startStallWatchdog() {
+        stallWatchdog?.invalidate()
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                let gap = Date().timeIntervalSince(self.lastFrameTime)
+                if gap > self.stallTimeoutSec && self.running {
+                    print(String(format: "[MJPEG] stall %.1fs — forcing reconnect", gap))
+                    self.handleDisconnect(reason: "stall")
+                }
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        stallWatchdog = timer
+    }
+
+    private func stopStallWatchdog() {
+        stallWatchdog?.invalidate()
+        stallWatchdog = nil
+    }
+
     private func handleDisconnect(reason: String) {
+        // Re-entry guard — stall watchdog + URLSession completion both call
+        // this. Only the first call actually schedules a reconnect.
+        if reconnecting { return }
+        reconnecting = true
         connected = false
         lastError = reason
+        stopStallWatchdog()
         task?.cancel()
         task = nil
         session?.invalidateAndCancel()
         session = nil
-        guard running else { return }
+        guard running else { reconnecting = false; return }
         reconnectAttempt = min(reconnectAttempt + 1, 4)
         let delay = min(0.5 * pow(2.0, Double(reconnectAttempt - 1)), 5.0)
+        print(String(format: "[MJPEG] reconnect in %.1fs (attempt %d, reason=%@)", delay, reconnectAttempt, reason))
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             guard let self, self.running else { return }
+            self.reconnecting = false
             self.connect()
         }
     }
@@ -150,7 +185,8 @@ final class MJPEGSource: NSObject, ObservableObject {
             print("[MJPEG] decode failed (\(jpeg.count)B)")
             return
         }
-        print("[MJPEG] decoded \(cg.width)x\(cg.height)")
+        // First-frame-only log; per-frame log is the fps line below.
+        if frameCount == 0 { print("[MJPEG] decoded \(cg.width)x\(cg.height) (first frame this run)") }
 
         let srcW = CGFloat(cg.width)
         let srcH = CGFloat(cg.height)
@@ -181,9 +217,13 @@ final class MJPEGSource: NSObject, ObservableObject {
 
         frameCount += 1
         let now = Date()
+        lastFrameTime = now
         let dt = now.timeIntervalSince(lastFpsTick)
         let fpsUpdate: Double? = dt >= 1.0 ? (Double(frameCount) / dt) : nil
-        if fpsUpdate != nil { frameCount = 0; lastFpsTick = now }
+        if let f = fpsUpdate {
+            print(String(format: "[MJPEG] %.1f fps  (%d frames in %.2fs)", f, frameCount, dt))
+            frameCount = 0; lastFpsTick = now
+        }
 
         // CVPixelBuffer is not Sendable — keep it in the lock-protected
         // bufferStore (pullLatest reads from there). Only ship the CGImage
@@ -207,7 +247,8 @@ extension MJPEGSource: URLSessionDataDelegate {
         // complete JPEG frame.
         flushFrame()
         let mime = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type") ?? ""
-        print("[MJPEG] response HTTP \(status) ct=\(mime)")
+        // Log only the boundary header (first response), not every JPEG part.
+        if mime.contains("multipart") { print("[MJPEG] response HTTP \(status) ct=\(mime)") }
         Task { @MainActor in
             self.connected = true
             self.lastError = nil

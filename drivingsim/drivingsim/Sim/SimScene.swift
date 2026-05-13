@@ -303,7 +303,7 @@ final class SimScene {
 
     private func addCamera() {
         cam = PerspectiveCamera()
-        cam.camera.fieldOfViewInDegrees = 75
+        cam.camera.fieldOfViewInDegrees = 65  // matches AI-Thinker ESP32-CAM OV2640 stock lens
         // Tight near plane so wall geometry stays visible even at hard collision.
         // Default RealityKit near is ~0.05m; we want ~0.01m.
         cam.camera.near = 0.01
@@ -328,8 +328,11 @@ final class SimScene {
             guard let self else { return }
             Task { @MainActor in
                 let m = modeProvider()
-                _ = depthRel   // retained for API stability; metric driver used everywhere
-                self.tick(kb: keyboard, hand: hand, depth: depth,
+                // autoSeekPy uses the relative-depth driver (DepthAnythingV2SmallF16);
+                // map modes use the metric driver. SimScene.tick reads a single
+                // `depth` reference for steering decisions — pick which based on mode.
+                let activeDepth: DepthDriver = (m == .autoSeekPy) ? depthRel : depth
+                self.tick(kb: keyboard, hand: hand, depth: activeDepth,
                           yolo: yolo, yoloPy: yoloPy, map: map,
                           mode: m, dt: 1.0 / 60.0)
             }
@@ -363,24 +366,26 @@ final class SimScene {
         //                  seek) drives. On reaching the target, MapDriver
         //                  takes over and A* paths back through the recorded
         //                  trajectory corridor.
-        let mapMode    = (mode == .autoMap || mode == .mapMetric || mode == .mapExplore)
-        let kbActive   = (mode != .automated && mode != .autoSeek && mode != .autoSeekPy && !mapMode)
-        let handActive = (mode == .hand || mode == .assisted)
+        // .mapExplore has two sub-modes:
+        //   manual (autoActive=false): kb + hand drive; `I` triggers one-shot scan
+        //   auto   (autoActive=true):  MapDriver runs 30°×12 sweep + A* loop;
+        //                              kb/hand suppressed to avoid fighting it.
+        let mapAutoMode = (mode == .autoMap || mode == .mapMetric)
+        let exploreManual = (mode == .mapExplore) && !map.autoActive
+        let exploreAuto   = (mode == .mapExplore) && map.autoActive
+        let kbActive   = (mode != .automated && mode != .autoSeek && mode != .autoSeekPy
+                          && !mapAutoMode && !exploreAuto)
+        let handActive = (mode == .hand || mode == .assisted || exploreManual)
         let depthWS    = (mode == .assisted || mode == .automated)
         let depthAD    = (mode == .automated)
 
-        // In map modes, decide controller by tour state.
-        //  .autoMap / .mapMetric: MapDriver drives only in homing/completed; autoSeekPy
-        //                        drives during exploring/approachingTarget.
-        //  .mapExplore:           MapDriver self-drives in every state (sweep, frontier,
-        //                        approach, homing, completed). YOLO still tracked for
-        //                        target detection but does not steer.
-        let exploreSelfDrives = (mode == .mapExplore)
-        let mapDriving = mapMode && (
-            exploreSelfDrives
-            || map.tourState == .homing
-            || map.tourState == .completed
-        )
+        // Map autonomous control. autoMap/mapMetric: homing/completed only.
+        // mapExplore-auto: any of the sweep/drive/done states.
+        let mapMode    = mapAutoMode
+        let mapDriving = (mapAutoMode && (
+                            map.tourState == .homing
+                         || map.tourState == .completed))
+                       || exploreAuto
         let mapSeeking = mapMode && !mapDriving
         let seekPyActive = (mode == .autoSeekPy) || mapSeeking
 

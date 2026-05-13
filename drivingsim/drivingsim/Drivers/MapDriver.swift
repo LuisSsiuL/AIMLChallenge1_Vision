@@ -64,7 +64,10 @@ final class MapDriver: ObservableObject {
     // exploring / approachingTarget / homing / completed → used by .autoMap & .mapMetric.
     // scanning / driving → used by .mapExplore (discrete scan-then-drive).
     enum TourState { case exploring, approachingTarget, homing, completed,
-                          scanning, driving }
+                          scanning, driving, idle,
+                          // Explore-auto sub-mode (.mapExplore + autoActive):
+                          exploreSweepRotate, exploreSweepDwell,
+                          explorePlanFrontier, exploreDrive, exploreDone }
     @Published private(set) var tourState: TourState = .exploring
     /// Inference gate — when true, ContentView's FPV pump should call
     /// `depth.submit(...)`. False during rotation + .driving / .homing to save
@@ -73,6 +76,19 @@ final class MapDriver: ObservableObject {
     // mapExplore selector — set from ContentView on mode change so MapDriver
     // knows to enter sweepingInitial instead of exploring on start.
     var exploreMode: Bool = false
+    // Explore-auto toggle. Manual sub-mode = false (default); Automatic = true.
+    @Published private(set) var autoActive: Bool = false
+    // 45° step sweep params for explore-auto.
+    private let exploreSweepSteps:    Int   = 8
+    private let exploreSweepStepRad:  Float = .pi / 4     // 45°
+    private let exploreYawTolerance:  Float = 0.05
+    private let exploreDwellTimeoutF: Int   = 300          // 5s @ 60Hz safety cap
+    private var exploreSweepIndex:    Int   = 0
+    private var exploreSweepStartYaw: Float = 0
+    private var exploreSweepTargetYaw:Float = 0
+    private var exploreSweepBaselineFrameID: UInt64 = 0
+    private var exploreSweepDwellFrames: Int = 0
+    private var exploreReplanFrames:  Int = 0
     private var startCell: Cell? = nil
     private(set) var markedTarget: Cell? = nil
     private let homeReachM:    Float = 0.5
@@ -114,9 +130,11 @@ final class MapDriver: ObservableObject {
 
     func start() {
         running = true
-        tourState = exploreMode ? .scanning : .exploring
+        // Explore mode is now pure mapping — no autonomous sweep/drive. Sits in
+        // .idle, publishes empty WASD, and only runs inference on `I`-key press.
+        tourState = exploreMode ? .idle : .exploring
         sweepStepIndex = 0
-        sweepRotateRemaining = exploreMode ? sweepRotateFrames : 0
+        sweepRotateRemaining = 0
         sweepDwellRemaining = 0
         sweepWaitingInference = false
         sweepInferenceWaitFrames = 0
@@ -150,6 +168,10 @@ final class MapDriver: ObservableObject {
         corridorGoalCell = nil
         seekConfirmCount = 0
         wantsInference = false
+        autoActive = false
+        exploreSweepIndex = 0
+        exploreSweepDwellFrames = 0
+        exploreReplanFrames = 0
         print("[MapDriver] stopped, map cleared")
     }
 
@@ -164,13 +186,73 @@ final class MapDriver: ObservableObject {
         tick(pose: (pos: pos, yaw: yaw))
     }
 
+    /// Real-hardware entry: dead-reckon pose from commanded WASD, then tick.
+    /// Used when SimScene isn't running (ESP32-CAM frame source). Caller must
+    /// have already set `useTruthPose = false`.
+    @MainActor
+    func tickDeadReckoned(keys: Set<UInt16>, dt: Float) {
+        poseEstimator.tickFromCommand(keys: keys, dt: dt)
+        tick(pose: (pos: poseEstimator.pos, yaw: poseEstimator.yaw))
+    }
+
     /// Called when YOLOPy detects the person. We use it only to mark the
     /// target cell so we know when the car has reached it (P2→P3 trigger).
     /// Target world position estimated from bbox center + height.
+    /// One-shot inference request — Explore mode only. Sets `wantsInference`
+    /// for one CoreML pass; cleared in `consumeMetricFrame` once the frame is
+    /// ingested into the grid.
+    @MainActor
+    func requestInferenceOnce() {
+        guard exploreMode else { return }
+        wantsInference = true
+    }
+
+    /// Toggle automatic explore mode. Manual ↔ Automatic.
+    /// Manual: tourState=.idle, no autonomous WASD. Press `I` for one-shot scan.
+    /// Automatic: 30°×12 sweep → frontier A* → drive → re-sweep.
+    @MainActor
+    func toggleAutoExplore() {
+        guard exploreMode else { return }
+        if autoActive {
+            autoActive = false
+            tourState = .idle
+            keys = []
+            command = .brake
+            currentPath.removeAll()
+            corridorGoalCell = nil
+            wantsInference = false
+            print("[MapDriver] auto-explore OFF → manual")
+        } else {
+            autoActive = true
+            exploreSweepIndex = 0
+            exploreSweepStartYaw = poseEstimator.yaw
+            exploreSweepTargetYaw = exploreSweepStartYaw
+            exploreSweepBaselineFrameID = latestMetricFrameID
+            exploreSweepDwellFrames = 0
+            exploreReplanFrames = 0
+            currentPath.removeAll()
+            corridorGoalCell = nil
+            tourState = .exploreSweepRotate
+            print("[MapDriver] auto-explore ON → sweep (8 × 45°)")
+        }
+    }
+
+    /// Wrap an angle into (-π, π].
+    @inline(__always)
+    private func wrapAngle(_ a: Float) -> Float {
+        var x = a
+        while x >  Float.pi { x -= 2 * .pi }
+        while x < -Float.pi { x += 2 * .pi }
+        return x
+    }
+
     @MainActor
     func updateSeekTarget(detectionCx: Float, detectionCy: Float,
                           detectionW: Float, detectionH: Float,
                           posePos: SIMD2<Float>, poseYaw: Float) {
+        // Explore mode = pure manual + mapping. No YOLO-driven autonomous
+        // seek; ignore detections.
+        if exploreMode { return }
         // Match the same camera FOV the FPV renderer uses (75°).
         let hfovDeg: Float = 75.0
         let angleH = (detectionCx - 0.5) * hfovDeg * Float.pi / 180.0
@@ -256,6 +338,9 @@ final class MapDriver: ObservableObject {
         lastIngestedMetricFrameID = snap.frameID
         ingestMetricDepth(meters: snap.meters, width: snap.width, height: snap.height,
                           posePos: snap.posePos, poseYaw: snap.poseYaw)
+        // Explore manual: clear single-shot inference gate once stamped.
+        // Auto: gate is managed by the sweep state machine, leave alone.
+        if exploreMode && !autoActive { wantsInference = false }
     }
 
     /// Wipe target on mode change.
@@ -490,18 +575,139 @@ final class MapDriver: ObservableObject {
 
         case .exploring:
             cmd = .brake   // autoSeekPy drives during exploring (.autoMap/.mapMetric)
+
+        case .idle:
+            cmd = .brake   // Explore manual — operator drives; MapDriver silent.
+
+        case .exploreSweepRotate:
+            // Rotate to next 45° target. While rotating, do NOT request
+            // inference (CoreML idle until we settle on the next step).
+            let target = exploreSweepStartYaw
+                       - Float(exploreSweepIndex + 1) * exploreSweepStepRad
+            exploreSweepTargetYaw = target
+            let err = wrapAngle(target - pose.yaw)
+            if abs(err) < exploreYawTolerance {
+                // Settled at this step's yaw → arm inference and dwell.
+                cmd = .brake
+                exploreSweepBaselineFrameID = latestMetricFrameID
+                exploreSweepDwellFrames = 0
+                wantsInference = true
+                tourState = .exploreSweepDwell
+            } else {
+                cmd = err < 0 ? .rotateLeft : .rotateRight
+                wantsInference = false
+            }
+
+        case .exploreSweepDwell:
+            // Hold position until one fresh CoreML frame is ingested into the
+            // grid. Timeout exists only as a stall safety net.
+            cmd = .brake
+            wantsInference = true
+            exploreSweepDwellFrames += 1
+            let gotFrame = latestMetricFrameID > exploreSweepBaselineFrameID
+            let timedOut = exploreSweepDwellFrames >= exploreDwellTimeoutF
+            if gotFrame || timedOut {
+                if timedOut && !gotFrame {
+                    print("[MapDriver] sweep step \(exploreSweepIndex+1)/\(exploreSweepSteps) TIMEOUT")
+                } else {
+                    print("[MapDriver] sweep step \(exploreSweepIndex+1)/\(exploreSweepSteps) ingested")
+                }
+                wantsInference = false
+                exploreSweepIndex += 1
+                if exploreSweepIndex >= exploreSweepSteps {
+                    tourState = .explorePlanFrontier
+                } else {
+                    tourState = .exploreSweepRotate
+                }
+            }
+
+        case .explorePlanFrontier:
+            // Brake while planning. BFS-flood from pose over free cells. Pick
+            // the farthest free cell adjacent to an unknown cell as the goal.
+            // BFS itself reconstructs the path — no A* fallback needed.
+            cmd = .brake
+            wantsInference = false
+            if let pick = farthestReachableFrontierFree(from: poseCell), !pick.path.isEmpty {
+                currentPath = pick.path
+                currentGoal = pick.goal
+                corridorGoalCell = pick.goal
+                exploreReplanFrames = 0
+                tourState = .exploreDrive
+                print("[MapDriver] farthest frontier goal=(\(pick.goal.col),\(pick.goal.row)) bfsDist=\(pick.dist) pathLen=\(pick.path.count)")
+            } else {
+                print("[MapDriver] no reachable frontier — stopping (one-sweep mode)")
+                autoActive = false
+                tourState = .idle
+                keys = []
+                command = .brake
+            }
+
+        case .exploreDrive:
+            // Drive the A* path. No CoreML inference during drive (saves
+            // compute; map updated on next sweep).
+            wantsInference = false
+            let reached: Bool = {
+                guard let g = corridorGoalCell else { return false }
+                let dc = poseCell.col - g.col, dr = poseCell.row - g.row
+                return (dc * dc + dr * dr) <= 4
+            }()
+            if reached {
+                exploreSweepIndex = 0
+                exploreSweepStartYaw = pose.yaw
+                currentPath.removeAll()
+                corridorGoalCell = nil
+                tourState = .exploreSweepRotate
+                cmd = .brake
+                print("[MapDriver] arrived — re-sweeping")
+            } else if !currentPath.isEmpty {
+                exploreReplanFrames += 1
+                if exploreReplanFrames >= replanIntervalFrames, let g = corridorGoalCell {
+                    exploreReplanFrames = 0
+                    let fresh = grid.aStar(from: poseCell, to: g, allowUnknown: true)
+                    if !fresh.isEmpty { currentPath = fresh }
+                }
+                cmd = WaypointFollower.nextCommand(
+                    posePos: pose.pos, poseYaw: pose.yaw,
+                    path: &currentPath, grid: grid)
+                if cmd == .brake {
+                    // Path emptied or blocked — restart sweep cycle.
+                    exploreSweepIndex = 0
+                    exploreSweepStartYaw = pose.yaw
+                    currentPath.removeAll()
+                    corridorGoalCell = nil
+                    tourState = .exploreSweepRotate
+                    print("[MapDriver] drive halted — re-sweeping")
+                }
+            } else {
+                // Unexpected empty path — re-sweep.
+                exploreSweepIndex = 0
+                exploreSweepStartYaw = pose.yaw
+                corridorGoalCell = nil
+                tourState = .exploreSweepRotate
+                cmd = .brake
+            }
+
+        case .exploreDone:
+            // Don't terminate — kick back into sweep so car never freezes.
+            tourState = .exploreSweepRotate
+            exploreSweepStartYaw = pose.yaw
+            exploreSweepIndex = 0
+            cmd = .rotateLeft
+            wantsInference = true
         }
 
-        // Publish WASD: in mapExplore, MapDriver drives every non-exploring
-        // state (scanning, driving, approachingTarget, homing, completed).
-        // In .autoMap/.mapMetric, only homing/completed.
-        let mapDriverInControl = exploreMode
-            ? (tourState == .scanning
-               || tourState == .driving
-               || tourState == .approachingTarget
-               || tourState == .homing
-               || tourState == .completed)
-            : (tourState == .homing || tourState == .completed)
+        // Publish WASD:
+        //   .autoMap/.mapMetric — homing/completed
+        //   .mapExplore auto    — sweep/drive/done (planning is brake-only)
+        //   .mapExplore manual  — never (.idle)
+        let mapDriverInControl =
+               tourState == .homing
+            || tourState == .completed
+            || tourState == .exploreSweepRotate
+            || tourState == .exploreSweepDwell
+            || tourState == .explorePlanFrontier
+            || tourState == .exploreDrive
+            || tourState == .exploreDone
         if mapDriverInControl {
             command = cmd
             keys    = keysFor(cmd)
@@ -517,8 +723,8 @@ final class MapDriver: ObservableObject {
             let personOverlay = markedTarget.map { [$0] } ?? []
             occupancyImage = grid.toZoomedCGImage(
                 centerCell:      poseCell,
-                halfWindowCells: 60,                 // larger window for 5cm grid (same world span as before)
-                pixelsPerCell:   2,
+                halfWindowCells: 100,                // 100 * 0.05m = 5m radius (10m × 10m window)
+                pixelsPerCell:   2,                  // 201 * 2px ≈ 402px panel
                 pathCells:       currentPath,
                 frontierCells:   frontierOverlay,
                 personCells:     personOverlay
@@ -537,6 +743,12 @@ final class MapDriver: ObservableObject {
                 case .completed:         return "completed"
                 case .scanning:          return "scanning(\(sweepStepIndex)/\(sweepSteps))"
                 case .driving:           return "driving"
+                case .idle:              return "idle(explore-manual)"
+                case .exploreSweepRotate:return "exploreSweepRotate(\(exploreSweepIndex)/\(exploreSweepSteps))"
+                case .exploreSweepDwell: return "exploreSweepDwell(\(exploreSweepIndex)/\(exploreSweepSteps))"
+                case .explorePlanFrontier:return "explorePlanFrontier"
+                case .exploreDrive:      return "exploreDrive"
+                case .exploreDone:       return "exploreDone"
                 }
             }()
             // Compact heartbeat — one line per 30 frames. Comment out for silence.
@@ -570,6 +782,69 @@ final class MapDriver: ObservableObject {
         let col = poseCell.col + Int((fx * Float(distance)).rounded())
         let row = poseCell.row + Int((fz * Float(distance)).rounded())
         return Cell(col: col, row: row)
+    }
+
+    /// BFS-flood from poseCell over `.free` cells. Return the farthest free
+    /// cell that has at least one `.unknown` 4-neighbor (= reachable frontier
+    /// boundary) AND the reconstructed BFS path to it. Bypasses A* entirely.
+    @MainActor
+    private func farthestReachableFrontierFree(from start: Cell)
+        -> (goal: Cell, dist: Int, path: [Cell])?
+    {
+        let cols = OccupancyGrid.cols
+        let rows = OccupancyGrid.rows
+        let n = cols * rows
+        var visited = [Bool](repeating: false, count: n)
+        var parent  = [Int32](repeating: -1, count: n)
+        let startKey = start.row * cols + start.col
+        guard grid.isValid(start), grid.state(start) == .free else { return nil }
+        visited[startKey] = true
+        var queue: [Cell] = [start]
+        var qHead = 0
+        var bestKey: Int = -1
+        var bestDist = 0
+        var distMap = [Int32](repeating: 0, count: n)
+        let nbrs8: [(Int,Int)] = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,1),(1,0)]
+        let nbrs4: [(Int,Int)] = [(-1,0),(1,0),(0,-1),(0,1)]
+        while qHead < queue.count {
+            let cur = queue[qHead]; qHead += 1
+            let curKey = cur.row * cols + cur.col
+            let curDist = Int(distMap[curKey])
+            // Check if frontier-adjacent.
+            for (dc, dr) in nbrs4 {
+                let nb = Cell(col: cur.col + dc, row: cur.row + dr)
+                if !grid.isValid(nb) { continue }
+                if grid.state(nb) == .unknown {
+                    if curDist > bestDist { bestDist = curDist; bestKey = curKey }
+                    break
+                }
+            }
+            // Expand through free cells (8-conn for shorter paths).
+            for (dc, dr) in nbrs8 {
+                let nb = Cell(col: cur.col + dc, row: cur.row + dr)
+                if !grid.isValid(nb) { continue }
+                let k = nb.row * cols + nb.col
+                if visited[k] { continue }
+                if grid.state(nb) != .free { continue }
+                visited[k] = true
+                parent[k] = Int32(curKey)
+                distMap[k] = Int32(curDist + 1)
+                queue.append(nb)
+            }
+        }
+        guard bestKey >= 0 else { return nil }
+        // Reconstruct path from start to goal.
+        var path: [Cell] = []
+        var k = bestKey
+        while k != startKey {
+            path.append(Cell(col: k % cols, row: k / cols))
+            let p = Int(parent[k])
+            if p < 0 { break }
+            k = p
+        }
+        path.reverse()
+        let goal = Cell(col: bestKey % cols, row: bestKey / cols)
+        return (goal, bestDist, path)
     }
 
     /// Goal picker after a 360° scan. Two modes:

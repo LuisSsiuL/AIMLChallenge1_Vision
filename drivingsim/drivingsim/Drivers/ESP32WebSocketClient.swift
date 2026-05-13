@@ -73,6 +73,7 @@ final class ESP32WebSocketClient: NSObject, ObservableObject {
         session = s
         let t = s.webSocketTask(with: ESP32Config.wsURL)
         task = t
+        print("[WS] connecting → \(ESP32Config.wsURL)")
         t.resume()
         listen()
     }
@@ -103,9 +104,11 @@ final class ESP32WebSocketClient: NSObject, ObservableObject {
     private func sendAxis(_ key: Character, _ down: Bool) {
         guard let t = task else { return }
         let msg = "\(key)\(down ? 1 : 0)"
+        print("[WS] tx \(msg)")
         t.send(.string(msg)) { [weak self] err in
             if let err {
                 Task { @MainActor in
+                    print("[WS] send err: \(err.localizedDescription)")
                     self?.handleDisconnect(reason: "send: \(err.localizedDescription)")
                 }
             }
@@ -138,6 +141,7 @@ extension ESP32WebSocketClient: URLSessionWebSocketDelegate {
                                 webSocketTask: URLSessionWebSocketTask,
                                 didOpenWithProtocol protocol: String?) {
         Task { @MainActor in
+            print("[WS] connected")
             self.connected = true
             self.lastError = nil
             self.reconnectAttempt = 0
