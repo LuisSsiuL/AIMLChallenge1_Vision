@@ -3,7 +3,8 @@
 //  drivingsim
 //
 //  Top-right preview of the colourised depth map + 7×7 zone overlay + command label.
-//  FAR row (top 40% of ROI) = F1–F7. NEAR row (bottom 60% of ROI) = N1–N7.
+//  Zone overlay: 30% top padding, 30% bottom padding, 50/50 FAR/NEAR split.
+//  FAR row = F1–F7. NEAR row = N1–N7.
 //
 
 import SwiftUI
@@ -27,16 +28,16 @@ struct DepthPreview: View {
                 )
             }
 
-            // Zone overlay — FAR row (top 40% of ROI) + NEAR row (bottom 60%)
+            // Zone overlay — matches live_depth_mlmodel_wasd_metric.py draw_nav_overlay:
+            // 30% top padding (NAV_ROW_START), 30% bottom padding, 50/50 FAR/NEAR split.
             GeometryReader { geo in
                 let w      = geo.size.width
                 let h      = geo.size.height
-                let row0    = h * 0.0             // band anchored at top of frame
-                let roiH    = h - row0
-                let farEnd  = row0 + roiH * 0.40  // far/near split (40/60 within ROI)
-                // NEAR row: half-height of the bottom 60%, aligned to the top
-                // of that band (so it sits flush under FAR, not stretched to bottom).
-                let nearEnd = farEnd + (h - farEnd) * 0.5
+                let row0    = h * 0.30            // 30% top padding (NAV_ROW_START)
+                let bottom  = h - h * 0.30        // 30% bottom padding
+                let roiH    = bottom - row0
+                let farEnd  = row0 + roiH * 0.50  // 50/50 split for display
+                let nearEnd = bottom
 
                 let count = CGFloat(7)
                 ZStack {

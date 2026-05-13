@@ -2,11 +2,12 @@
 //  DepthDriver.swift
 //  drivingsim
 //
-//  Native Swift port of live_depth_mlmodel_wasd 11.py.
-//  v11: split must-reverse into hard/soft with grace+hold, static-stuck
-//  gated by center<145, navigation gamma 0.6→0.8, threshold 20→16.
-//  Takes CVPixelBuffer frames (518×518 from SimFPVRenderer),
-//  runs DepthAnythingV2 SmallF16 CoreML model, computes 7×7 zone grid
+//  Native Swift port of live_depth_mlmodel_wasd_metric.py.
+//  Aligned with the metric script's decision tree: navRowStart=0.30,
+//  navigationGamma=0.8, displayGamma=0.8, full NEAR row (bottom 60%),
+//  coverage sweep enabled, no zone mirroring, direct key mapping.
+//  Uses DepthAnythingV2MetricIndoorSmallF16 (large=far, no inversion needed).
+//  Takes CVPixelBuffer frames, runs CoreML model, computes 7×7 zone grid
 //  (FAR row top 40% + NEAR row bottom 60% of ROI, 7 columns each),
 //  decides a WASD command, smooths via majority-vote buffer.
 //
@@ -94,21 +95,21 @@ final class DepthDriver: ObservableObject {
     var left:     Bool { keys.contains(KeyboardMonitor.A) }
     var right:    Bool { keys.contains(KeyboardMonitor.D) }
 
-    // Tunables — live_depth_mlmodel_wasd 5.py.
+    // Tunables — live_depth_mlmodel_wasd_metric.py.
     private let forwardThreshold:    Float = 120
     private let stuckThreshold:      Float = 60
     private let steerMinDiff:        Float = 15
     private let hysteresisBonus:     Float = 10
-    private let navRowStart:         Float = 0.0   // band anchored at top of frame (no sky skip)
+    private let navRowStart:         Float = 0.30  // top of ROI as fraction of frame height (ignore sky/background)
     private let cmdSmoothFrames:     Int   = 3
     private let reverseEscapeFrames: Int   = 8
     // Navigation gamma — applied to depth values used for zone scoring.
-    // < 1 brightens / compresses, making close-range obstacles more
-    // discriminating. Matches NAVIGATION_GAMMA in live_depth_mlmodel_wasd_metric.py.
-    private let navigationGamma: Float = 0.4
-    // Display gamma — applied to depth preview only. Matches DISPLAY_GAMMA in
-    // the metric script.
-    private let displayGamma: Float = 0.4
+    // Matches NAVIGATION_GAMMA in live_depth_mlmodel_wasd_metric.py.
+    private let navigationGamma: Float = 0.8
+    // Display gamma — applied to depth preview only.
+    // Metric model: 0.8 (live_depth_mlmodel_wasd_metric.py)
+    // Relative model: 2.0 (live_depth_mlmodel_wasd_explore.py)
+    nonisolated(unsafe) private var displayGamma: Float = 0.8
     // Close-range reverse safety (v6)
     private let reverseBlockedCenterThreshold:    Float = 70
     private let reverseBlockedMinNearZones:       Int   = 5
@@ -161,8 +162,8 @@ final class DepthDriver: ObservableObject {
     private let loopReverseWindow:      Int   = 60
     private let loopReverseThreshold:   Int   = 3
     private let loopBreakerFramesMax:   Int   = 20
-    // Coverage sweep (Roomba-style) — explore.py. Disabled: tour mode in MapDriver handles exploration.
-    private let coverageModeEnabled:           Bool  = false
+    // Coverage sweep (Roomba-style) — explore.py. Matches live_depth_mlmodel_wasd_explore.py.
+    private let coverageModeEnabled:           Bool  = true
     private let coveragePlateauDiffThreshold:  Float = 8.0
     private let coveragePlateauConfirmFrames:  Int   = 18
     private let coverageOpenCenterThreshold:   Float = 145.0
@@ -233,9 +234,17 @@ final class DepthDriver: ObservableObject {
     nonisolated(unsafe) private var statWindowT = CACurrentMediaTime()
 
     nonisolated(unsafe) private var modelName: String
+    /// Relative models (e.g. DepthAnythingV2SmallF16) output disparity (large=close).
+    /// They need `255 - u8` inversion so high=far matches the decision tree.
+    /// Metric models (large=far) do not need inversion.
+    nonisolated(unsafe) private var needsInvert: Bool = false
 
     init(modelName: String = "DepthAnythingV2MetricIndoorSmallF16") {
         self.modelName = modelName
+        // Relative model needs inversion; metric model does not.
+        self.needsInvert = !modelName.lowercased().contains("metric")
+        // Display gamma: relative=2.0 (explore script), metric=0.8 (metric script)
+        self.displayGamma = self.needsInvert ? 2.0 : 0.8
         loadModel()
     }
 
@@ -373,7 +382,7 @@ final class DepthDriver: ObservableObject {
             return
         }
 
-        let (depthU8, w, h) = Self.depthBufferToU8(outBuf)
+        let (depthU8, w, h) = Self.depthBufferToU8(outBuf, invert: needsInvert)
 
         // Preview: apply display gamma to normalized depth (high=far).
         let depthU8Display = Self.applyGamma(depthU8, gamma: displayGamma)
@@ -480,8 +489,9 @@ final class DepthDriver: ObservableObject {
         prevMotionRoiH = roiH
 
         // ── Pre-decide must-reverse gate (v6 + v9 static-stuck) ─────────
-        let nearScoresCar = nz.map(\.obstacleScore).reversed() as [Float]
-        let farScoresCar  = fz.map(\.obstacleScore).reversed() as [Float]
+        // No mirror — matches live_depth_mlmodel_wasd_explore.py.
+        let nearScoresCar = nz.map(\.obstacleScore) as [Float]
+        let farScoresCar  = fz.map(\.obstacleScore) as [Float]
         let nc3Min = min(nearScoresCar[2], min(nearScoresCar[3], nearScoresCar[4]))
         let nc3Avg = (nearScoresCar[2] + nearScoresCar[3] + nearScoresCar[4]) / 3
         let blockedCount = nearScoresCar.filter { $0 < reverseBlockedCenterThreshold }.count
@@ -558,11 +568,11 @@ final class DepthDriver: ObservableObject {
         var pidLeftBonus: Float = 0
         var pidRightBonus: Float = 0
         if pidEnabled && !mustReverseNow {
-            let farScoresCar = fz.map(\.obstacleScore).reversed() as [Float]
+            let farScoresPid = fz.map(\.obstacleScore) as [Float]
             let nL = (nearScoresCar[0] + nearScoresCar[1] + nearScoresCar[2]) / 3
             let nR = (nearScoresCar[4] + nearScoresCar[5] + nearScoresCar[6]) / 3
-            let fL = (farScoresCar[0]  + farScoresCar[1]  + farScoresCar[2])  / 3
-            let fR = (farScoresCar[4]  + farScoresCar[5]  + farScoresCar[6])  / 3
+            let fL = (farScoresPid[0]  + farScoresPid[1]  + farScoresPid[2])  / 3
+            let fR = (farScoresPid[4]  + farScoresPid[5]  + farScoresPid[6])  / 3
             // NEAR weighted higher to reduce obstacle-side wobble.
             let leftMetric  = 0.7 * nL + 0.3 * fL
             let rightMetric = 0.7 * nR + 0.3 * fR
@@ -706,33 +716,36 @@ final class DepthDriver: ObservableObject {
             print("[DepthDriver] NEAR [N1–N7] = \(nStr)")
         }
 
-        // A/D inverted relative to logical command (mirrored camera mount).
+        // Direct key mapping — matches live_depth_mlmodel_wasd_explore.py.
+        // FORWARD_LEFT = W+A, FORWARD_RIGHT = W+D, etc.
         switch smoothed {
         case .forward:      keys = [KeyboardMonitor.W]
-        case .forwardLeft:  keys = [KeyboardMonitor.W, KeyboardMonitor.D]
-        case .forwardRight: keys = [KeyboardMonitor.W, KeyboardMonitor.A]
+        case .forwardLeft:  keys = [KeyboardMonitor.W, KeyboardMonitor.A]
+        case .forwardRight: keys = [KeyboardMonitor.W, KeyboardMonitor.D]
         case .reverse:      keys = [KeyboardMonitor.S]
-        case .reverseLeft:  keys = [KeyboardMonitor.S, KeyboardMonitor.D]
-        case .reverseRight: keys = [KeyboardMonitor.S, KeyboardMonitor.A]
-        case .rotateLeft:   keys = [KeyboardMonitor.D]
-        case .rotateRight:  keys = [KeyboardMonitor.A]
+        case .reverseLeft:  keys = [KeyboardMonitor.S, KeyboardMonitor.A]
+        case .reverseRight: keys = [KeyboardMonitor.S, KeyboardMonitor.D]
+        case .rotateLeft:   keys = [KeyboardMonitor.A]
+        case .rotateRight:  keys = [KeyboardMonitor.D]
         case .brake:        keys = []
         }
     }
 
     // Returns (farZones[7], nearZones[7]).
     // FAR  = top 40% of ROI — path ahead.
-    // NEAR = bottom 60% of ROI — immediate obstacles.
+    // NEAR = middle portion of bottom 60% — immediate obstacles.
+    // Bottom 30% of frame excluded (floor pixels that read as "far" and
+    // would mask a faceplanted-against-wall condition).
+    // Matches live_depth_mlmodel_wasd_metric.py zone scoring with bottom padding.
     @MainActor
     private func computeZoneScores(depthU8: [UInt8], w: Int, h: Int, rowStart: Int)
         -> ([ZoneScore], [ZoneScore])
     {
         let roiH = h - rowStart
         let farRowEnd  = rowStart + Int(Float(roiH) * 0.4)
-        // NEAR row: half of the bottom 60%, aligned to the top of that band
-        // (immediately below FAR). Skips the very bottom of the frame where
-        // floor pixels dominate.
-        let nearRowEnd = farRowEnd + Int(Float(h - farRowEnd) * 0.5)
+        // NEAR row: exclude bottom 30% of frame (floor). Use from farRowEnd
+        // down to 70% of frame height.
+        let nearRowEnd = rowStart + Int(Float(roiH) * 0.70)
         let fz = computeRow(depthU8: depthU8, w: w, rowStart: rowStart,   rowEnd: farRowEnd,  prefix: "F")
         let nz = computeRow(depthU8: depthU8, w: w, rowStart: farRowEnd,  rowEnd: nearRowEnd, prefix: "N")
         return (fz, nz)
@@ -848,9 +861,9 @@ final class DepthDriver: ObservableObject {
     @MainActor
     private func decideCommand(farZones: [ZoneScore], nearZones: [ZoneScore],
                                pidLeftBonus: Float = 0, pidRightBonus: Float = 0) -> DrivingCommand {
-        // Mirror horizontally — depth image left/right is opposite to car steering left/right.
-        let farScores  = farZones.map(\.obstacleScore).reversed() as [Float]
-        let nearScores = nearZones.map(\.obstacleScore).reversed() as [Float]
+        // No mirror — matches live_depth_mlmodel_wasd_explore.py which uses zones directly.
+        let farScores  = farZones.map(\.obstacleScore) as [Float]
+        let nearScores = nearZones.map(\.obstacleScore) as [Float]
 
         // Update outside-side memory before reading bonuses (mirror=false: scores already in car space).
         if explorationEnabled {
@@ -1028,9 +1041,11 @@ final class DepthDriver: ObservableObject {
 
     // ── Static helpers (depth post-processing) ───────────────────────────────
 
-    /// Single-pass per-frame min/max normalization + invert.
-    /// Matches live_depth_mlmodel_wasd.py:103-121 (no percentile, no EMA).
-    nonisolated static func depthBufferToU8(_ buf: CVPixelBuffer) -> ([UInt8], Int, Int) {
+    /// Single-pass per-frame min/max normalization.
+    /// When `invert` is true (relative/disparity model), applies `255 - u8` so
+    /// high values = far/open, matching the explore script's convention.
+    /// Metric model (large=far) passes invert=false.
+    nonisolated static func depthBufferToU8(_ buf: CVPixelBuffer, invert: Bool = false) -> ([UInt8], Int, Int) {
         CVPixelBufferLockBaseAddress(buf, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buf, .readOnly) }
         let w = CVPixelBufferGetWidth(buf)
@@ -1105,10 +1120,11 @@ final class DepthDriver: ObservableObject {
             for i in 0..<floats.count {
                 var n = (floats[i] - dMin) / dRange
                 if n < 0 { n = 0 } else if n > 1 { n = 1 }
-                // No invert. Apple's "Estimated depth map" output: large value = far.
-                // After normalization: high u8 = far (clear), low u8 = near (obstacle).
-                // Decision tree thresholds operate on this directly.
-                u8[i] = UInt8(n * 255.0)
+                // Metric model (large=far): no invert → high u8 = far (clear).
+                // Relative model (large=close): invert → high u8 = far (clear).
+                // Matches live_depth_mlmodel_wasd_explore.py `depth_u8 = 255 - depth_u8`.
+                let val = invert ? (1.0 - n) : n
+                u8[i] = UInt8(val * 255.0)
             }
         }
         return (u8, w, h)
@@ -1157,17 +1173,42 @@ final class DepthDriver: ObservableObject {
         guard !depthU8.isEmpty else { return nil }
         var rgba = [UInt8](repeating: 0, count: width * height * 4)
         for i in 0..<depthU8.count {
-            // Display gamma < 1 stretches low end → preview brightens. Raw u8
-            // buffer used by DepthProjector / zone scorer is unchanged.
-            let raw = Float(depthU8[i]) / 255.0
-            let v   = powf(raw, 0.55)
-            // Inferno-ish: dark→purple→red→orange→yellow
-            let r = UInt8(min(255, max(0, v * 255.0 * 1.0)))
-            let g = UInt8(min(255, max(0, (v - 0.3) * 255.0 * 1.4)))
-            let b = UInt8(min(255, max(0, (0.4 - v) * 255.0 * 1.5)))
-            rgba[i * 4 + 0] = r
-            rgba[i * 4 + 1] = g
-            rgba[i * 4 + 2] = b
+            // Inferno colormap matching cv2.COLORMAP_INFERNO from the Python script.
+            // low values (close/obstacle) = dark/black
+            // high values (far/open) = bright/yellow
+            let v = Float(depthU8[i]) / 255.0
+            // Inferno approximation: black → purple → red → orange → yellow
+            let r: Float
+            let g: Float
+            let b: Float
+            if v < 0.25 {
+                // black → dark purple
+                let t = v / 0.25
+                r = t * 0.28
+                g = 0.0
+                b = t * 0.33
+            } else if v < 0.5 {
+                // dark purple → red/magenta
+                let t = (v - 0.25) / 0.25
+                r = 0.28 + t * 0.62
+                g = 0.0
+                b = 0.33 + t * (-0.13)
+            } else if v < 0.75 {
+                // red → orange
+                let t = (v - 0.5) / 0.25
+                r = 0.90 + t * 0.10
+                g = t * 0.55
+                b = 0.20 - t * 0.20
+            } else {
+                // orange → yellow/white
+                let t = (v - 0.75) / 0.25
+                r = 1.0
+                g = 0.55 + t * 0.45
+                b = t * 0.40
+            }
+            rgba[i * 4 + 0] = UInt8(min(255, max(0, r * 255.0)))
+            rgba[i * 4 + 1] = UInt8(min(255, max(0, g * 255.0)))
+            rgba[i * 4 + 2] = UInt8(min(255, max(0, b * 255.0)))
             rgba[i * 4 + 3] = 255
         }
         let cs = CGColorSpaceCreateDeviceRGB()

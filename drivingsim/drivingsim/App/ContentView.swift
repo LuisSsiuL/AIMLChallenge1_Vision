@@ -86,8 +86,10 @@ struct ContentView: View {
     @StateObject private var hand     = HandJoystick()
     // Metric model — used by .autoSeekPy + .autoMap
     @StateObject private var depth    = DepthDriver()
-    // Relative model — retired (.mapDepth removed). Kept declared so any
-    // residual references compile; stopped on every mode change.
+    // Relative model (DepthAnythingV2SmallF16) — used by .autoSeekPy.
+    // Outputs disparity (large=close); DepthDriver inverts automatically
+    // (needsInvert=true) so high score = far/open for the decision tree.
+    // Better wall/floor discrimination than metric model for ground-level cameras.
     @StateObject private var depthRel = DepthDriver(modelName: "DepthAnythingV2SmallF16")
     @StateObject private var yolo     = YOLODriver()
     @StateObject private var yoloPy   = YOLOPythonDriver()
@@ -310,7 +312,7 @@ struct ContentView: View {
                     }
                 }
                 if mode == .autoSeekPy {
-                    // Relative DepthAnythingV2 preview + zone grid. YOLO disabled.
+                    // Relative DepthAnythingV2SmallF16 preview + zone grid (inverted: dark=close, bright=far).
                     VStack(spacing: 4) {
                         DepthPreview(driver: depthRel)
                             .frame(width: 240, height: 240)
@@ -473,7 +475,7 @@ struct ContentView: View {
         }
         // Two depth drivers:
         //   `depth`    — metric model, used by .autoMap/.mapMetric/.mapExplore + .assisted/.automated
-        //   `depthRel` — relative DepthAnythingV2 SmallF16, used by .autoSeekPy
+        //   `depthRel` — relative DepthAnythingV2SmallF16 + inversion, used by .autoSeekPy
         let wantsRel    = (newMode == .autoSeekPy)
         let wantsMetric = (newMode.needsDepth && !wantsRel)
                            || newMode == .autoMap
@@ -487,7 +489,7 @@ struct ContentView: View {
         mapDrv.exploreMode = (newMode == .mapExplore)
 
         // Source frame size = active depth model's expected input.
-        // autoSeekPy → depthRel (DepthAnythingV2SmallF16, typically 518×392).
+        // autoSeekPy → depthRel (DepthAnythingV2SmallF16, 518×392).
         // others    → depth (metric, 518×518).
         let activeInputSize = (newMode == .autoSeekPy) ? depthRel.inputSize : depth.inputSize
         if !source.isExternalFrameSource {
@@ -564,7 +566,7 @@ struct ContentView: View {
                     let pSubmit = mapDrv.poseEstimator
                     depth.submit(buf, posePos: pSubmit.pos, poseYaw: pSubmit.yaw)
                 }
-                // autoSeekPy: relative DepthAnythingV2 (no metric projection).
+                // autoSeekPy: relative DepthAnythingV2SmallF16 (inverted, no metric projection).
                 if mode == .autoSeekPy { depthRel.submit(buf) }
                 if mode.needsYOLO    { yolo.submit(buf) }
                 if mode.needsYOLOPy  { yoloPy.submit(buf) }
