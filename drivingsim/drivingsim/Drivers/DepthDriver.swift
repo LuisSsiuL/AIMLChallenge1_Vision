@@ -99,12 +99,16 @@ final class DepthDriver: ObservableObject {
     private let stuckThreshold:      Float = 60
     private let steerMinDiff:        Float = 15
     private let hysteresisBonus:     Float = 10
-    private let navRowStart:         Float = 0.0   // no sky to skip indoors
+    private let navRowStart:         Float = 0.0   // band anchored at top of frame (no sky skip)
     private let cmdSmoothFrames:     Int   = 3
     private let reverseEscapeFrames: Int   = 8
-    // Navigation gamma (v7) — applied to depth values used for zone scoring.
-    // < 1 brightens / compresses, making close-range obstacles more discriminating.
-    private let navigationGamma: Float = 1
+    // Navigation gamma — applied to depth values used for zone scoring.
+    // < 1 brightens / compresses, making close-range obstacles more
+    // discriminating. Matches NAVIGATION_GAMMA in live_depth_mlmodel_wasd_metric.py.
+    private let navigationGamma: Float = 0.4
+    // Display gamma — applied to depth preview only. Matches DISPLAY_GAMMA in
+    // the metric script.
+    private let displayGamma: Float = 0.4
     // Close-range reverse safety (v6)
     private let reverseBlockedCenterThreshold:    Float = 70
     private let reverseBlockedMinNearZones:       Int   = 5
@@ -371,10 +375,11 @@ final class DepthDriver: ObservableObject {
 
         let (depthU8, w, h) = Self.depthBufferToU8(outBuf)
 
-        // Build colourised CGImage for preview from raw normalized depth.
-        let preview = Self.colorize(depthU8: depthU8, width: w, height: h)
+        // Preview: apply display gamma to normalized depth (high=far).
+        let depthU8Display = Self.applyGamma(depthU8, gamma: displayGamma)
+        let preview = Self.colorize(depthU8: depthU8Display, width: w, height: h)
 
-        // v7: apply navigation gamma (0.6) to depth values used for zone scoring.
+        // Navigation gamma (NAVIGATION_GAMMA = 0.8) for zone scoring.
         let depthU8Nav = Self.applyGamma(depthU8, gamma: navigationGamma)
 
         // Optional: extract raw meters for occupancy projection (.mapMetric mode).
@@ -701,15 +706,16 @@ final class DepthDriver: ObservableObject {
             print("[DepthDriver] NEAR [N1–N7] = \(nStr)")
         }
 
+        // A/D inverted relative to logical command (mirrored camera mount).
         switch smoothed {
         case .forward:      keys = [KeyboardMonitor.W]
-        case .forwardLeft:  keys = [KeyboardMonitor.W, KeyboardMonitor.A]
-        case .forwardRight: keys = [KeyboardMonitor.W, KeyboardMonitor.D]
+        case .forwardLeft:  keys = [KeyboardMonitor.W, KeyboardMonitor.D]
+        case .forwardRight: keys = [KeyboardMonitor.W, KeyboardMonitor.A]
         case .reverse:      keys = [KeyboardMonitor.S]
-        case .reverseLeft:  keys = [KeyboardMonitor.S, KeyboardMonitor.A]
-        case .reverseRight: keys = [KeyboardMonitor.S, KeyboardMonitor.D]
-        case .rotateLeft:   keys = [KeyboardMonitor.A]
-        case .rotateRight:  keys = [KeyboardMonitor.D]
+        case .reverseLeft:  keys = [KeyboardMonitor.S, KeyboardMonitor.D]
+        case .reverseRight: keys = [KeyboardMonitor.S, KeyboardMonitor.A]
+        case .rotateLeft:   keys = [KeyboardMonitor.D]
+        case .rotateRight:  keys = [KeyboardMonitor.A]
         case .brake:        keys = []
         }
     }
@@ -722,9 +728,13 @@ final class DepthDriver: ObservableObject {
         -> ([ZoneScore], [ZoneScore])
     {
         let roiH = h - rowStart
-        let farRowEnd = rowStart + Int(Float(roiH) * 0.4)
-        let fz = computeRow(depthU8: depthU8, w: w, rowStart: rowStart, rowEnd: farRowEnd, prefix: "F")
-        let nz = computeRow(depthU8: depthU8, w: w, rowStart: farRowEnd,  rowEnd: h,        prefix: "N")
+        let farRowEnd  = rowStart + Int(Float(roiH) * 0.4)
+        // NEAR row: half of the bottom 60%, aligned to the top of that band
+        // (immediately below FAR). Skips the very bottom of the frame where
+        // floor pixels dominate.
+        let nearRowEnd = farRowEnd + Int(Float(h - farRowEnd) * 0.5)
+        let fz = computeRow(depthU8: depthU8, w: w, rowStart: rowStart,   rowEnd: farRowEnd,  prefix: "F")
+        let nz = computeRow(depthU8: depthU8, w: w, rowStart: farRowEnd,  rowEnd: nearRowEnd, prefix: "N")
         return (fz, nz)
     }
 

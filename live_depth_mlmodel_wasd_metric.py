@@ -34,7 +34,7 @@ CAMERA_SCAN_LIMIT = 6   # probe indices 0..N-1 for local/USB/Continuity cameras
 MODEL_PATH = os.path.join(
     os.path.dirname(__file__),
     "drivingsim", "drivingsim", "Models",
-    "DepthAnythingV2SmallF16.mlpackage",
+    "DepthAnythingV2MetricIndoorSmallF16.mlpackage",
 )
 
 # --- Capture ---
@@ -61,7 +61,7 @@ DEBUG_NAVIGATION      = False  # Set to True to print zone scores and decisions
 
 # --- Gamma Correction ---
 NAVIGATION_GAMMA      = 0.8    # Applied to depth values before zone scoring (< 1 = brighten/compress)
-DISPLAY_GAMMA         = 2      # Applied only to display colorization
+DISPLAY_GAMMA         = 0.8      # Applied only to display colorization
 
 # Additional reverse safety for close-range blockage.
 # Uses temporal confirmation to avoid single-frame floor/lighting noise.
@@ -244,8 +244,8 @@ def run_inference(frame_bgr: np.ndarray, model: DepthAnythingV2CoreML):
     else:
         depth_u8 = np.zeros_like(depth, dtype=np.uint8)
 
-    # Invert: low values = close/obstacle, high values = far/open
-    depth_u8 = 255 - depth_u8
+    # Metric model outputs actual depth in metres: high value = far (open space).
+    # No inversion needed — polarity is already correct for navigation scoring.
 
     # Apply gamma correction for navigation (zone scoring)
     depth_u8_nav = (np.power(depth_u8 / 255.0, NAVIGATION_GAMMA) * 255).astype(np.uint8)
@@ -1485,10 +1485,12 @@ def draw_nav_overlay(
     """Draw the 2-row perspective-aware navigation overlay."""
     h, w = depth_u8.shape
     row0 = int(h * NAV_ROW_START)
-    roi_h = h - row0
+    # 20% bottom padding: segments stop at 80% of frame height
+    display_bottom = h - int(h * 0.2)
+    roi_h = display_bottom - row0
     
-    # Split ROI into far (top 40%) and near (bottom 60%)
-    far_row_end = row0 + int(roi_h * 0.4)
+    # Split ROI into far (top 50%) and near (bottom 50%)
+    far_row_end = row0 + int(roi_h * 0.5)
     
     overlay = display.copy()
     
@@ -1510,7 +1512,7 @@ def draw_nav_overlay(
         x1 = i * near_zone_width
         x2 = (i + 1) * near_zone_width if i < 6 else w
         color = _ZONE_COLORS.get(zone.state, (128, 128, 128))
-        cv2.rectangle(overlay, (x1, far_row_end), (x2 - 1, h - 1), color, -1)
+        cv2.rectangle(overlay, (x1, far_row_end), (x2 - 1, display_bottom - 1), color, -1)
     
     cv2.addWeighted(overlay, 0.28, display, 0.72, 0, display)
     
@@ -1547,7 +1549,7 @@ def draw_nav_overlay(
         x2 = (i + 1) * near_zone_width if i < 6 else w
         cx = (x1 + x2) // 2
         
-        cv2.rectangle(display, (x1, far_row_end), (x2 - 1, h - 1),
+        cv2.rectangle(display, (x1, far_row_end), (x2 - 1, display_bottom - 1),
                       (255, 255, 255), 1, cv2.LINE_AA)
         
         # Zone label
@@ -1558,7 +1560,7 @@ def draw_nav_overlay(
         score_label = f"{zone.obstacle_score:.0f}"
         (sw, sh), _ = cv2.getTextSize(score_label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
         sx = cx - sw // 2
-        sy = (far_row_end + h) // 2 + sh // 2
+        sy = (far_row_end + display_bottom) // 2 + sh // 2
         cv2.putText(display, score_label, (sx, sy),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
         cv2.putText(display, score_label, (sx, sy),

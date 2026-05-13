@@ -11,6 +11,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
 #include <WebSocketsServer.h>
@@ -42,20 +43,35 @@ static bool keyW = false, keyA = false, keyS = false, keyD = false;
 
 static void applyMotors() {
 #if MOTORS_ENABLED
-  bool active = (keyW || keyA || keyS || keyD);
+  // Differential drive:
+  //   W      : both fwd full
+  //   S      : both rev full
+  //   A      : tank-turn left  (L rev, R fwd)
+  //   D      : tank-turn right (L fwd, R rev)
+  //   W+A    : arc fwd-left  (L slow fwd,  R full fwd)
+  //   W+D    : arc fwd-right (L full fwd,  R slow fwd)
+  //   S+A    : arc rev-left  (L slow rev,  R full rev)
+  //   S+D    : arc rev-rev-right
+  int leftDir = LOW, rightDir = LOW;
+  int leftSpd = 0,   rightSpd = 0;
 
-  if (keyW)      { digitalWrite(LEFT_DIR_PIN, HIGH); digitalWrite(RIGHT_DIR_PIN, HIGH); }
-  else if (keyS) { digitalWrite(LEFT_DIR_PIN, LOW);  digitalWrite(RIGHT_DIR_PIN, LOW);  }
-  else if (keyA) { digitalWrite(LEFT_DIR_PIN, HIGH); digitalWrite(RIGHT_DIR_PIN, LOW);  }
-  else if (keyD) { digitalWrite(LEFT_DIR_PIN, LOW);  digitalWrite(RIGHT_DIR_PIN, HIGH); }
+  if (keyW && keyA)      { leftDir = HIGH; rightDir = HIGH; leftSpd = MOTOR_SPEED;       rightSpd = MOTOR_SPEED_INNER; }
+  else if (keyW && keyD) { leftDir = HIGH; rightDir = HIGH; leftSpd = MOTOR_SPEED_INNER; rightSpd = MOTOR_SPEED;       }
+  else if (keyS && keyA) { leftDir = LOW;  rightDir = LOW;  leftSpd = MOTOR_SPEED;       rightSpd = MOTOR_SPEED_INNER; }
+  else if (keyS && keyD) { leftDir = LOW;  rightDir = LOW;  leftSpd = MOTOR_SPEED_INNER; rightSpd = MOTOR_SPEED;       }
+  else if (keyW)         { leftDir = HIGH; rightDir = HIGH; leftSpd = MOTOR_SPEED;       rightSpd = MOTOR_SPEED;       }
+  else if (keyS)         { leftDir = LOW;  rightDir = LOW;  leftSpd = MOTOR_SPEED;       rightSpd = MOTOR_SPEED;       }
+  else if (keyA)         { leftDir = HIGH; rightDir = LOW;  leftSpd = MOTOR_SPEED;       rightSpd = MOTOR_SPEED;       }
+  else if (keyD)         { leftDir = LOW;  rightDir = HIGH; leftSpd = MOTOR_SPEED;       rightSpd = MOTOR_SPEED;       }
 
-  int speed = active ? MOTOR_SPEED : 0;
-  ledcWrite(0, speed);
-  ledcWrite(4, speed);
+  digitalWrite(LEFT_DIR_PIN,  leftDir);
+  digitalWrite(RIGHT_DIR_PIN, rightDir);
+  ledcWrite(0, leftSpd);
+  ledcWrite(4, rightSpd);
 
-  Serial.printf("keys W=%d A=%d S=%d D=%d  L_DIR=%d R_DIR=%d  spd=%d\n",
+  Serial.printf("keys W=%d A=%d S=%d D=%d  L_DIR=%d R_DIR=%d  L_spd=%d R_spd=%d\n",
                 keyW, keyA, keyS, keyD,
-                digitalRead(LEFT_DIR_PIN), digitalRead(RIGHT_DIR_PIN), speed);
+                leftDir, rightDir, leftSpd, rightSpd);
 #endif
 }
 
@@ -255,12 +271,19 @@ static void handleRes() {
 static void wifiInit() {
 #if WIFI_AP_MODE
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASS);
+  // Channel 6 — less crowded than default 1 in most apartments.
+  // ssid_hidden=0, max_connection=1 (only the Mac), beacon every 100ms.
+  WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASS, /*channel*/ 6, /*hidden*/ 0, /*maxConn*/ 1);
+  // Disable AP power-save so beacons + frames are sent immediately.
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  // Max TX power (8.5 dBm units; 78 = 19.5 dBm = max for ESP32).
+  esp_wifi_set_max_tx_power(78);
   IPAddress ip = WiFi.softAPIP();
-  Serial.printf("[wifi] AP up — ssid=%s pass=%s ip=http://%s/\n",
+  Serial.printf("[wifi] AP up — ssid=%s pass=%s ch=6 ip=http://%s/\n",
                 WIFI_AP_SSID, WIFI_AP_PASS, ip.toString().c_str());
 #else
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);              // disable PS — eliminates 100–300ms stalls
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.printf("[wifi] joining %s", WIFI_SSID);
   while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }

@@ -19,18 +19,19 @@ enum ESP32Config {
     /// Non-nil → use this address verbatim and skip mDNS + AP.
     /// Handy before the mDNS firmware is flashed, or when .local is flaky.
     /// Set to `nil` to fall through to AP / mDNS rules.
-    static let manualHost: String? = "172.16.16.15"
+    static let manualHost: String? = nil
 
     /// Mirror to `WIFI_AP_MODE` in `esp32/include/config.h`.
     /// true  → ESP creates its own WiFi (ESPCar). Mac must join that SSID.
     /// false → ESP joins router (default; uses mDNS host below).
-    static let useAPMode: Bool = false
+    static let useAPMode: Bool = true
 
     /// Bonjour hostname advertised by the firmware mDNS responder.
     /// Matches `MDNS_HOSTNAME` in esp32/src/main.cpp.
     static let mdnsHost = "espcar.local"
 
-    /// Fixed AP-mode IP from `WiFi.softAPIP()` default.
+    /// Fixed AP-mode IP from `WiFi.softAPIP()` default. Literal IP avoids
+    /// flaky mDNS resolution over the ESP's own AP network.
     static let apHost   = "192.168.4.1"
 
     static var host: String {

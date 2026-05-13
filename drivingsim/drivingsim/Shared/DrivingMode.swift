@@ -17,7 +17,7 @@ enum DrivingMode: String, Identifiable {
     case autoSeekPy  // Python YOLO ROAM↔SEEK
     case autoMap     // trajectory mapping (metric depth) + YOLO seek + A* home
     case mapMetric   // trajectory + metric-depth projection → occupancy grid (≤5m)
-    case mapExplore  // autonomous frontier exploration: sweep → frontier → target → home
+    case mapExplore  // manual driving + on-demand metric-depth mapping (press I to scan)
 
     var id: String { rawValue }
 
@@ -40,7 +40,7 @@ enum DrivingMode: String, Identifiable {
     var needsHand:    Bool { self == .hand || self == .assisted }
     var needsDepth:   Bool { self == .assisted || self == .automated || self == .autoSeek || self == .autoSeekPy }
     var needsYOLO:    Bool { self == .autoSeek }
-    var needsYOLOPy:  Bool { self == .autoSeekPy || self == .autoMap || self == .mapMetric || self == .mapExplore }
+    var needsYOLOPy:  Bool { self == .autoMap || self == .mapMetric || self == .mapExplore }
     var anyYOLO:      Bool { needsYOLO || needsYOLOPy }
     var needsMap:     Bool { self == .autoMap || self == .mapMetric || self == .mapExplore }
 

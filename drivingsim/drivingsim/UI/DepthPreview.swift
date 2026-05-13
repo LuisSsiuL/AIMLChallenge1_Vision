@@ -31,9 +31,12 @@ struct DepthPreview: View {
             GeometryReader { geo in
                 let w      = geo.size.width
                 let h      = geo.size.height
-                let row0   = h * 0.0             // navRowStart — no sky skip indoors
-                let roiH   = h - row0
-                let farEnd = row0 + roiH * 0.40  // far/near split
+                let row0    = h * 0.0             // band anchored at top of frame
+                let roiH    = h - row0
+                let farEnd  = row0 + roiH * 0.40  // far/near split (40/60 within ROI)
+                // NEAR row: half-height of the bottom 60%, aligned to the top
+                // of that band (so it sits flush under FAR, not stretched to bottom).
+                let nearEnd = farEnd + (h - farEnd) * 0.5
 
                 let count = CGFloat(7)
                 ZStack {
@@ -61,7 +64,7 @@ struct DepthPreview: View {
                     ForEach(Array(driver.nearZones.enumerated()), id: \.offset) { i, z in
                         let x0  = w * CGFloat(i)     / count
                         let x1  = w * CGFloat(i + 1) / count
-                        let bh  = h - farEnd
+                        let bh  = nearEnd - farEnd
                         let cy  = farEnd + bh / 2
                         Rectangle()
                             .fill(zoneColor(z.state).opacity(0.28))

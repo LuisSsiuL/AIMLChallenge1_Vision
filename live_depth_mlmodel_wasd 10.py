@@ -33,7 +33,7 @@ CAMERA_SCAN_LIMIT = 6   # probe indices 0..N-1 for local/USB/Continuity cameras
 # --- CoreML Model ---
 MODEL_PATH = os.path.join(
     os.path.dirname(__file__),
-    "models",
+    "drivingsim", "drivingsim", "Models",
     "DepthAnythingV2SmallF16.mlpackage",
 )
 
