@@ -250,11 +250,8 @@ final class MapDriver: ObservableObject {
     func updateSeekTarget(detectionCx: Float, detectionCy: Float,
                           detectionW: Float, detectionH: Float,
                           posePos: SIMD2<Float>, poseYaw: Float) {
-        // Explore mode = pure manual + mapping. No YOLO-driven autonomous
-        // seek; ignore detections.
-        if exploreMode { return }
-        // Match the same camera FOV the FPV renderer uses (75°).
-        let hfovDeg: Float = 75.0
+        // ESP32-CAM stock lens HFOV ~65°. Sim renderer matches.
+        let hfovDeg: Float = 65.0
         let angleH = (detectionCx - 0.5) * hfovDeg * Float.pi / 180.0
         let worldAngle = poseYaw + angleH
         let estimatedDist = min(8.0, max(1.0, 0.55 / max(detectionH, 0.05)))
@@ -268,15 +265,21 @@ final class MapDriver: ObservableObject {
             if personCells.count > 5 { personCells.removeFirst() }
         }
 
-        // mapExplore: just bookmark the target cell — the goal-picker in
-        // scanning state will route to it once detection is confirmed. The
-        // approachingTarget transition happens when the car reaches the
-        // nearby free cell (handled in .driving completion).
+        // mapExplore: bookmark target during sweep/drive/plan. Next
+        // explorePlanFrontier pass routes the goal to a free cell adjacent
+        // to the target instead of the farthest BFS frontier.
         //
-        // .autoMap / .mapMetric: legacy behaviour — flip straight into
-        // .approachingTarget once roam-gate satisfied.
+        // .autoMap / .mapMetric: legacy — flip into .approachingTarget once
+        // roam-gate satisfied.
+        let exploreActiveState =
+               tourState == .scanning
+            || tourState == .driving
+            || tourState == .exploreSweepRotate
+            || tourState == .exploreSweepDwell
+            || tourState == .explorePlanFrontier
+            || tourState == .exploreDrive
         let canBookmark = exploreMode
-                          ? (tourState == .scanning || tourState == .driving)
+                          ? exploreActiveState
                           : (tourState == .exploring && maxDistFromStart >= minExploreM)
         if markedTarget == nil && canBookmark {
             seekConfirmCount += 1
@@ -309,10 +312,21 @@ final class MapDriver: ObservableObject {
     // Bbox-based "near target" threshold — bbox h ≥ this counts toward P2→P3.
     private let bboxNearH: Float = 0.55
 
-    /// No-op kept for ContentView call site compatibility. With trajectory-
-    /// only mapping there's no per-frame depth pass to mask.
+    /// Latest YOLO person bbox seen this tick (or nil if no detection). Set
+    /// by ContentView each frame; used to short-circuit sweep with a direct
+    /// autoSeekPy-style bbox steer when a person appears mid-explore.
+    @Published private(set) var liveYoloBox: (cx: Float, w: Float, h: Float)? = nil
+
     @MainActor
-    func clearSeekBox() { /* no-op */ }
+    func setLiveYolo(cx: Float, w: Float, h: Float) {
+        liveYoloBox = (cx, w, h)
+    }
+
+    /// ContentView call when no detection this frame. Resets bbox-seek mode.
+    @MainActor
+    func clearSeekBox() {
+        liveYoloBox = nil
+    }
 
     /// Project a metric depth frame into the occupancy grid (.mapMetric mode).
     /// Only ≤5m hits stamped. Caller must pass meters straight from the metric
@@ -622,20 +636,38 @@ final class MapDriver: ObservableObject {
             }
 
         case .explorePlanFrontier:
-            // Brake while planning. BFS-flood from pose over free cells. Pick
-            // the farthest free cell adjacent to an unknown cell as the goal.
-            // BFS itself reconstructs the path — no A* fallback needed.
+            // Brake while planning. Priority:
+            //   1. If markedTarget exists → A*/BFS to nearest free cell adjacent
+            //      to that target (YOLO-driven seek).
+            //   2. Else farthest free cell adjacent to unknown (frontier).
             cmd = .brake
             wantsInference = false
-            if let pick = farthestReachableFrontierFree(from: poseCell), !pick.path.isEmpty {
+            var planned = false
+            if let tgt = markedTarget,
+               let goal = FrontierExplorer.nearestFreeNear(tgt,
+                                                            radius: targetApproachAdjacentRadius,
+                                                            grid: grid),
+               let path = bfsPath(from: poseCell, to: goal), !path.isEmpty
+            {
+                currentPath = path
+                currentGoal = goal
+                corridorGoalCell = goal
+                exploreReplanFrames = 0
+                tourState = .exploreDrive
+                planned = true
+                print("[MapDriver] TARGET-SEEK goal=(\(goal.col),\(goal.row)) pathLen=\(path.count) target=(\(tgt.col),\(tgt.row))")
+            }
+            if !planned, let pick = farthestReachableFrontierFree(from: poseCell), !pick.path.isEmpty {
                 currentPath = pick.path
                 currentGoal = pick.goal
                 corridorGoalCell = pick.goal
                 exploreReplanFrames = 0
                 tourState = .exploreDrive
+                planned = true
                 print("[MapDriver] farthest frontier goal=(\(pick.goal.col),\(pick.goal.row)) bfsDist=\(pick.dist) pathLen=\(pick.path.count)")
-            } else {
-                print("[MapDriver] no reachable frontier — stopping (one-sweep mode)")
+            }
+            if !planned {
+                print("[MapDriver] no reachable frontier or target — stopping")
                 autoActive = false
                 tourState = .idle
                 keys = []
@@ -694,6 +726,25 @@ final class MapDriver: ObservableObject {
             exploreSweepIndex = 0
             cmd = .rotateLeft
             wantsInference = true
+        }
+
+        // YOLO override — when explore-auto and a person is currently in
+        // frame, ignore the state-machine cmd and steer the bbox directly
+        // (autoSeekPy-style). cx<0.45 → forwardLeft, >0.55 → forwardRight,
+        // else forward. Near target (h≥bboxNearH) → brake. Reverts to sweep
+        // cmd automatically the next tick liveYoloBox is nil.
+        let exploreActiveAuto = exploreMode && autoActive
+        if exploreActiveAuto, let det = liveYoloBox {
+            wantsInference = false  // freeze sweep inference while seeking
+            if det.h >= bboxNearH {
+                cmd = .brake
+            } else if det.cx < 0.45 {
+                cmd = .forwardLeft
+            } else if det.cx > 0.55 {
+                cmd = .forwardRight
+            } else {
+                cmd = .forward
+            }
         }
 
         // Publish WASD:
@@ -782,6 +833,53 @@ final class MapDriver: ObservableObject {
         let col = poseCell.col + Int((fx * Float(distance)).rounded())
         let row = poseCell.row + Int((fz * Float(distance)).rounded())
         return Cell(col: col, row: row)
+    }
+
+    /// BFS through `.free` cells from `start` to `goal`. Returns the path or
+    /// nil if unreachable. Used by target-seek goal routing.
+    @MainActor
+    private func bfsPath(from start: Cell, to goal: Cell) -> [Cell]? {
+        let cols = OccupancyGrid.cols
+        let rows = OccupancyGrid.rows
+        let n = cols * rows
+        guard grid.isValid(start), grid.isValid(goal) else { return nil }
+        guard grid.state(start) == .free, grid.state(goal) == .free else { return nil }
+        if start == goal { return [] }
+        var visited = [Bool](repeating: false, count: n)
+        var parent  = [Int32](repeating: -1, count: n)
+        let startKey = start.row * cols + start.col
+        let goalKey  = goal.row  * cols + goal.col
+        visited[startKey] = true
+        var queue: [Cell] = [start]
+        var qHead = 0
+        let nbrs8: [(Int,Int)] = [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,1),(1,0)]
+        while qHead < queue.count {
+            let cur = queue[qHead]; qHead += 1
+            let curKey = cur.row * cols + cur.col
+            if curKey == goalKey {
+                var path: [Cell] = []
+                var k = goalKey
+                while k != startKey {
+                    path.append(Cell(col: k % cols, row: k / cols))
+                    let p = Int(parent[k])
+                    if p < 0 { break }
+                    k = p
+                }
+                path.reverse()
+                return path
+            }
+            for (dc, dr) in nbrs8 {
+                let nb = Cell(col: cur.col + dc, row: cur.row + dr)
+                if !grid.isValid(nb) { continue }
+                let k = nb.row * cols + nb.col
+                if visited[k] { continue }
+                if grid.state(nb) != .free { continue }
+                visited[k] = true
+                parent[k] = Int32(curKey)
+                queue.append(nb)
+            }
+        }
+        return nil
     }
 
     /// BFS-flood from poseCell over `.free` cells. Return the farthest free

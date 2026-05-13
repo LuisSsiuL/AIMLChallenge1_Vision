@@ -40,7 +40,7 @@ enum DrivingMode: String, Identifiable {
     var needsHand:    Bool { self == .hand || self == .assisted }
     var needsDepth:   Bool { self == .assisted || self == .automated || self == .autoSeek || self == .autoSeekPy }
     var needsYOLO:    Bool { self == .autoSeek }
-    var needsYOLOPy:  Bool { self == .autoMap || self == .mapMetric }
+    var needsYOLOPy:  Bool { self == .autoMap || self == .mapMetric || self == .mapExplore }
     var anyYOLO:      Bool { needsYOLO || needsYOLOPy }
     var needsMap:     Bool { self == .autoMap || self == .mapMetric || self == .mapExplore }
 

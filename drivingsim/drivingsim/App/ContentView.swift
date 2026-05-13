@@ -582,6 +582,7 @@ struct ContentView: View {
                             detectionCx: det.cx, detectionCy: det.cy,
                             detectionW:  det.w,  detectionH: det.h,
                             posePos: pose.pos, poseYaw: pose.yaw)
+                        mapDrv.setLiveYolo(cx: det.cx, w: det.w, h: det.h)
                     } else {
                         mapDrv.clearSeekBox()
                     }
